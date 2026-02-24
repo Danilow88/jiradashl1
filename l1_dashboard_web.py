@@ -13,9 +13,151 @@ from threading import Timer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# SQLite: persistência das notas (substitui planilha Google)
+# SQLite: persistência das notas (local); Google Sheet: backup e central (todas as informações)
 def _db_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'l1_notas.db')
+
+def _get_sheet():
+    """Abre a planilha Google (GOOGLE_SHEET_ID_NOTAS). Retorna (spreadsheet, None) ou (None, erro)."""
+    sheet_id = (os.environ.get('GOOGLE_SHEET_ID_NOTAS') or '').strip()
+    if not sheet_id:
+        return None, 'GOOGLE_SHEET_ID_NOTAS não configurado'
+    creds_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', '').strip()
+    try:
+        if creds_path and os.path.isfile(creds_path):
+            import gspread
+            gc = gspread.service_account(filename=creds_path)
+        else:
+            from google.oauth2.credentials import Credentials
+            import google.auth.transport.requests
+            client_id = os.environ.get('VERTEX_CLIENT_ID', '').strip()
+            client_secret = os.environ.get('VERTEX_CLIENT_SECRET', '').strip()
+            refresh = os.environ.get('VERTEX_REFRESH_TOKEN', '').strip()
+            if not (client_id and client_secret and refresh):
+                return None, 'Configure GOOGLE_APPLICATION_CREDENTIALS ou VERTEX_CLIENT_ID/SECRET/REFRESH_TOKEN'
+            creds = Credentials(
+                token=None, refresh_token=refresh, token_uri='https://oauth2.googleapis.com/token',
+                client_id=client_id, client_secret=client_secret,
+                scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive.file'],
+            )
+            creds.refresh(google.auth.transport.requests.Request())
+            import gspread
+            gc = gspread.authorize(creds)
+        sh = gc.open_by_key(sheet_id)
+        return sh, None
+    except Exception as e:
+        return None, str(e)[:200]
+
+def _sheet_ensure_headers(worksheet, headers):
+    """Garante que a primeira linha tem os headers; se a planilha estiver vazia, insere."""
+    try:
+        row1 = worksheet.row_values(1) if worksheet.row_count else []
+        if not row1 or row1[0] != headers[0]:
+            worksheet.insert_row(headers, 1)
+    except Exception:
+        try:
+            worksheet.insert_row(headers, 1)
+        except Exception:
+            pass
+
+def _sync_notas_to_sheet(notas):
+    """Sincroniza notas para a aba 'Notas' da planilha Google (issue_key, nota, comentario, updated_at)."""
+    if not notas:
+        return
+    sh, err = _get_sheet()
+    if err or not sh:
+        return
+    try:
+        from datetime import datetime
+        ws = sh.worksheet('Notas') if 'Notas' in [s.title for s in sh.worksheets()] else sh.add_worksheet('Notas', rows=500, cols=6)
+        _sheet_ensure_headers(ws, ['issue_key', 'nota', 'comentario', 'updated_at'])
+        keys_in_sheet = ws.col_values(1)[1:]  # skip header
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        for key, v in notas.items():
+            if not (key and isinstance(key, str) and key.strip()):
+                continue
+            key = key.strip()
+            nota = v.get('nota') if isinstance(v, dict) else None
+            comentario = (v.get('comentario') or '')[:500] if isinstance(v, dict) else ''
+            try:
+                idx = keys_in_sheet.index(key) + 2 if key in keys_in_sheet else None
+            except ValueError:
+                idx = None
+            row = [key, nota if nota is not None else '', comentario, now]
+            if idx is not None:
+                ws.update(f'A{idx}:D{idx}', [row])
+            else:
+                ws.append_row(row)
+                keys_in_sheet.append(key)
+    except Exception:
+        pass
+
+def _sync_auditoria_to_sheet(issue_key, analista, catalogo, preenchimento, solucao, comentarios):
+    """Append uma linha na aba 'Auditoria' (feedback manual do painel)."""
+    if not issue_key or not issue_key.strip():
+        return
+    sh, err = _get_sheet()
+    if err or not sh:
+        return
+    try:
+        from datetime import datetime
+        ws = sh.worksheet('Auditoria') if 'Auditoria' in [s.title for s in sh.worksheets()] else sh.add_worksheet('Auditoria', rows=500, cols=10)
+        _sheet_ensure_headers(ws, ['issue_key', 'analista', 'catalogo', 'preenchimento', 'solucao', 'comentarios', 'updated_at'])
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        comentarios_clean = (comentarios or '')[:2000].replace('\r', ' ')
+        analista_clean = (analista or '')[:200]
+        ws.append_row([issue_key.strip(), analista_clean, str(catalogo or ''), str(preenchimento or ''), str(solucao or ''), comentarios_clean, now])
+    except Exception:
+        pass
+
+def _sync_pontos_to_sheet(pontos_por_issue):
+    """Sincroniza pontos Ollama (por ticket) na aba 'Pontos'."""
+    if not pontos_por_issue:
+        return
+    sh, err = _get_sheet()
+    if err or not sh:
+        return
+    try:
+        from datetime import datetime
+        ws = sh.worksheet('Pontos') if 'Pontos' in [s.title for s in sh.worksheets()] else sh.add_worksheet('Pontos', rows=500, cols=6)
+        _sheet_ensure_headers(ws, ['issue_key', 'summary', 'melhorias', 'fortes', 'updated_at'])
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        for item in pontos_por_issue:
+            key = (item.get('key') or '').strip()
+            if not key:
+                continue
+            summary = (item.get('summary') or '')[:500]
+            mel = item.get('melhorias') or []
+            fort = item.get('fortes') or []
+            mel_txt = ' | '.join(str(m) for m in mel)[:2000]
+            fort_txt = ' | '.join(str(f) for f in fort)[:2000]
+            ws.append_row([key, summary, mel_txt, fort_txt, now])
+    except Exception:
+        pass
+
+def _sync_feedback_analistas_to_sheet(by_analyst):
+    """Sincroniza feedback por analista (Ollama) na aba 'Feedback Analistas'."""
+    if not by_analyst:
+        return
+    sh, err = _get_sheet()
+    if err or not sh:
+        return
+    try:
+        from datetime import datetime
+        ws = sh.worksheet('Feedback Analistas') if 'Feedback Analistas' in [s.title for s in sh.worksheets()] else sh.add_worksheet('Feedback Analistas', rows=300, cols=6)
+        _sheet_ensure_headers(ws, ['assignee', 'ticket_count', 'feedback', 'melhorias', 'fortes', 'updated_at'])
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        for a in by_analyst:
+            assignee = (a.get('assignee') or '')[:200]
+            tc = a.get('ticketCount') or 0
+            feedback = (a.get('feedback') or '')[:2000]
+            mel = a.get('melhorias') or []
+            fort = a.get('fortes') or []
+            mel_txt = ' | '.join(str(m) for m in mel)[:2000]
+            fort_txt = ' | '.join(str(f) for f in fort)[:2000]
+            ws.append_row([assignee, tc, feedback, mel_txt, fort_txt, now])
+    except Exception:
+        pass
 
 def _init_db_notas():
     conn = sqlite3.connect(_db_path())
@@ -47,6 +189,7 @@ from l1_dashboard import (
     fetch_issue_sla,
     fetch_issue_sla_raw,
     _sla_name_is_relevant,
+    _format_sla_list_for_ollama,
     get_issue_note_from_rovo,
     get_issue_note_from_agent,
     get_issue_note_from_ollama,
@@ -71,7 +214,11 @@ from l1_dashboard import (
     stats_volume_by_period,
     stats_volume_by_analyst,
     stats_reopened_for_period,
+    stats_reopened_for_date_range,
+    _parse_jql_date_range,
     stats_pontos_melhoria_fortes,
+    get_issue_pontos_ollama,
+    stats_feedback_analistas_ollama,
     DEFAULT_JQL,
     fetch_my_filters,
     fetch_filter_by_id,
@@ -357,6 +504,9 @@ HTML_TEMPLATE = '''
     .pontos-tickets { display: block; margin-top: 4px; font-size: 0.85rem; color: var(--nubank-text-muted); }
     .pontos-tickets a { color: var(--nubank-purple); text-decoration: none; }
     .pontos-tickets a:hover { text-decoration: underline; }
+    .fb-chamados-dropdown summary::-webkit-details-marker { display: none; }
+    .fb-chamados-dropdown summary::before { content: '\u25b6\00a0'; font-size: 0.75em; }
+    .fb-chamados-dropdown[open] summary::before { content: '\u25bc\00a0'; }
     .pontos-abnt { font-family: 'Times New Roman', Times, serif; font-size: 12pt; line-height: 1.5; text-align: justify; margin: 0 0 1em 0; }
     .pontos-abnt ul { margin: 0.5em 0; padding-left: 1.5em; }
     .pontos-abnt li { margin-bottom: 0.25em; }
@@ -374,6 +524,7 @@ HTML_TEMPLATE = '''
     #pontosRelatorioMelhoria li, #pontosRelatorioFortes li { white-space: normal; word-wrap: break-word; overflow-wrap: break-word; margin-bottom: 0.5em; }
     .btn-sla { font-size: 12px; padding: 8px 14px; cursor: pointer; background: rgba(130, 10, 209, 0.1); color: var(--nubank-purple); border: 1px solid var(--nubank-purple); border-radius: 10px; font-weight: 600; }
     .btn-sla:hover { background: var(--nubank-purple); color: #fff; }
+    .sla-vencido-badge { display: inline-block; margin-left: 8px; padding: 2px 8px; font-size: 11px; font-weight: 600; color: #b91c1c; background: rgba(220, 38, 38, 0.15); border: 1px solid #dc2626; border-radius: 6px; }
     #slaOverlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(68, 58, 83, 0.5); z-index: 1000; align-items: center; justify-content: center; backdrop-filter: blur(6px); }
     #slaOverlay.show { display: flex; }
     #slaPanel {
@@ -449,6 +600,45 @@ HTML_TEMPLATE = '''
     td.sla-cell { min-width: 180px; vertical-align: top; position: sticky; right: 0; background: var(--nubank-card); box-shadow: -4px 0 8px rgba(0,0,0,0.06); z-index: 0; }
     tbody tr:nth-child(even) td.sla-cell { background: #faf8fc; }
     tbody tr:hover td.sla-cell { background: rgba(130, 10, 209, 0.06); }
+    /* Painel de Auditoria (sidebar) – Relatório pontos ABNT */
+    #auditSidebar {
+      display: none; position: fixed; top: 0; right: 0; width: 320px; max-width: 95vw; height: 100vh;
+      background: #e8e4f0; box-shadow: -4px 0 24px rgba(68, 58, 83, 0.2); z-index: 1200;
+      flex-direction: column; overflow: hidden; border-left: 1px solid #d1cce0;
+    }
+    #auditSidebar.show { display: flex; }
+    .audit-sidebar-header {
+      display: flex; align-items: center; justify-content: space-between; padding: 16px 18px;
+      background: #e8e4f0; border-bottom: 1px solid #d1cce0;
+    }
+    .audit-sidebar-header h4 { margin: 0; font-size: 1.1rem; font-weight: 700; color: #1a1a1a; }
+    .audit-sidebar-close { background: none; border: none; font-size: 22px; cursor: pointer; color: #444; line-height: 1; padding: 0 4px; }
+    .audit-sidebar-close:hover { color: #1a1a1a; }
+    .audit-sidebar-body { padding: 16px 18px; overflow-y: auto; flex: 1; }
+    .audit-load-btn {
+      display: block; width: 100%; padding: 12px 16px; margin-bottom: 14px; font-size: 0.95rem; font-weight: 600;
+      background: #0d9488; color: #fff; border: none; border-radius: 10px; cursor: pointer; text-align: center;
+    }
+    .audit-load-btn:hover { background: #0f766e; }
+    .audit-ticket-id {
+      background: #6d28d9; color: #fff; text-align: center; padding: 12px; border-radius: 10px; margin-bottom: 16px;
+      font-weight: 700; font-size: 1rem; letter-spacing: 0.02em;
+    }
+    .audit-field { margin-bottom: 14px; }
+    .audit-field label { display: block; margin-bottom: 6px; font-weight: 600; color: #1a1a1a; font-size: 0.9rem; }
+    .audit-field select {
+      width: 100%; padding: 10px 12px; font-size: 0.9rem; border-radius: 8px; border: 1px solid #c4b8d4;
+      background: #f5f3f7; color: #1a1a1a; appearance: auto;
+    }
+    .audit-field textarea {
+      width: 100%; min-height: 100px; padding: 10px 12px; font-size: 0.9rem; border-radius: 8px;
+      border: 1px solid #c4b8d4; background: #f5f3f7; color: #1a1a1a; resize: vertical; box-sizing: border-box;
+    }
+    .audit-actions { display: flex; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #d1cce0; }
+    .audit-btn { flex: 1; padding: 12px 16px; font-size: 0.95rem; font-weight: 600; border: none; border-radius: 10px; cursor: pointer; background: #5b21b6; color: #fff; }
+    .audit-btn:hover { background: #4c1d95; }
+    .btn-auditar { font-size: 11px; padding: 4px 10px; margin-left: 8px; cursor: pointer; background: rgba(109, 40, 217, 0.15); color: #5b21b6; border: 1px solid #7c3aed; border-radius: 8px; font-weight: 600; }
+    .btn-auditar:hover { background: rgba(109, 40, 217, 0.25); }
   </style>
 </head>
 <body>
@@ -459,6 +649,40 @@ HTML_TEMPLATE = '''
         <button type="button" class="sla-close" aria-label="Fechar">&times;</button>
       </div>
       <div class="sla-panel-body" id="slaContent"></div>
+    </div>
+  </div>
+  <div id="auditSidebar">
+    <div class="audit-sidebar-header">
+      <h4>Painel de Auditoria</h4>
+      <button type="button" class="audit-sidebar-close" aria-label="Fechar">&times;</button>
+    </div>
+    <div class="audit-sidebar-body">
+      <button type="button" class="audit-load-btn" id="auditLoadBtn">Carregar / Atualizar Dados da Linha</button>
+      <div class="audit-ticket-id" id="auditTicketId">—</div>
+      <div class="audit-field">
+        <label for="auditAnalista">Analista</label>
+        <input type="text" id="auditAnalista" placeholder="Nome do analista (Assignee)" style="width: 100%; padding: 10px 12px; font-size: 0.9rem; border-radius: 8px; border: 1px solid #c4b8d4; background: #f5f3f7; color: #1a1a1a; box-sizing: border-box;">
+      </div>
+      <div class="audit-field">
+        <label for="auditCatalogo">Catálogo ou Categorização</label>
+        <select id="auditCatalogo"><option value="0">0%</option><option value="20" selected>20%</option><option value="40">40%</option><option value="60">60%</option><option value="80">80%</option><option value="100">100%</option></select>
+      </div>
+      <div class="audit-field">
+        <label for="auditPreenchimento">Preenchimento do Ticket</label>
+        <select id="auditPreenchimento"><option value="0">0%</option><option value="20" selected>20%</option><option value="40">40%</option><option value="60">60%</option><option value="80">80%</option><option value="100">100%</option></select>
+      </div>
+      <div class="audit-field">
+        <label for="auditSolucao">Solução Aplicada</label>
+        <select id="auditSolucao"><option value="0">0%</option><option value="20" selected>20%</option><option value="40">40%</option><option value="60">60%</option><option value="80">80%</option><option value="100">100%</option></select>
+      </div>
+      <div class="audit-field">
+        <label for="auditComentarios">Comentários (Obrigatório para nota 0%)</label>
+        <textarea id="auditComentarios" placeholder="Categorização correta, descrição clara do pedido..."></textarea>
+      </div>
+      <div class="audit-actions">
+        <button type="button" class="audit-btn" id="auditSalvar">Salvar</button>
+        <button type="button" class="audit-btn" id="auditSalvarProximo">Salvar e Próximo</button>
+      </div>
     </div>
   </div>
   <div class="container">
@@ -594,11 +818,31 @@ HTML_TEMPLATE = '''
       <div class="chart-grid">
         <div class="chart-card" id="chartReaberturaCard">
           <h3>Tickets reabertos no per\u00edodo</h3>
-          <p id="chartReaberturaEmpty" class="chart-empty">Selecione m\u00eas e ano e busque para ver reaberturas no mesmo per\u00edodo (JQL: status CHANGED FROM Done/Closed/Resolved).</p>
+          <p id="chartReaberturaEmpty" class="chart-empty">Escolha o per\u00edodo (m\u00eas e ano) e clique em &quot;Buscar reabertos&quot;. JQL: status CHANGED FROM (Done, Closed, Resolved) no per\u00edodo escolhido.</p>
+          <div id="reopenedPeriodRow" style="margin-bottom: 14px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px;">
+            <label for="reopenedMonthSelect">M\u00eas</label>
+            <select id="reopenedMonthSelect" style="width: 100px;">
+              <option value="">—</option>
+              <option value="1">Jan</option><option value="2">Fev</option><option value="3">Mar</option>
+              <option value="4">Abr</option><option value="5">Mai</option><option value="6">Jun</option>
+              <option value="7">Jul</option><option value="8">Ago</option><option value="9">Set</option>
+              <option value="10">Out</option><option value="11">Nov</option><option value="12">Dez</option>
+            </select>
+            <label for="reopenedYearSelect">Ano</label>
+            <select id="reopenedYearSelect" style="width: 80px;">
+              <option value="">—</option>
+              {% for y in years_list or [] %}<option value="{{ y }}">{{ y }}</option>{% endfor %}
+            </select>
+            <button type="button" id="btnBuscarReabertosSection" class="secondary">Buscar reabertos</button>
+          </div>
           <div id="chartReaberturaWrapper" style="display: none;">
             <canvas id="chartReabertura"></canvas>
             <p id="chartReaberturaTotal" style="margin-top: 12px; font-weight: 600; color: var(--nubank-text);"></p>
-            <p class="chart-hint">Mesmo per\u00edodo aplicado no modo lista. Clique no gr\u00e1fico para ver os tickets.</p>
+            <p class="chart-hint">Clique no gr\u00e1fico para ver os tickets no modal.</p>
+            <div id="reopenedListContainer" style="margin-top: 16px; display: none;"></div>
+            <div style="margin-top: 12px;">
+              <button type="button" id="btnBuscarReabertos" class="secondary" title="Abre esta busca no modo lista (aba Lista).">Buscar tickets reabertos na lista</button>
+            </div>
           </div>
         </div>
       </div>
@@ -639,6 +883,17 @@ HTML_TEMPLATE = '''
         </details>
       </div>
       <div class="row" style="margin-top: 8px;"><button type="button" id="btnPontosOllama" class="secondary" disabled title="Analisa por ticket: SLA (Jira), Comments do Assignee, Satisfaction. Pontos negativos: SLA fora do prazo, linguagem n\u00e3o corporativa/\u00e1gil, sem @Reporter. Pontos positivos: o inverso (Ollama, at\u00e9 12 chamados).">Extrair pontos (Ollama)</button></div>
+      <div class="chart-card" id="feedbackAnalistasCard" style="margin-top: 20px;">
+        <h3>Compilado por analistas avaliados nas notas</h3>
+        <p class="chart-hint" style="font-size: 0.85rem; color: var(--nubank-text-muted); margin-top: 0;">Feedback por analista (QA): CSAT m\u00e9dio, cumprimento de prazos e linguagem clara/formal/objetiva.</p>
+        <p class="chart-hint" style="font-size: 0.8rem; color: var(--nubank-text-muted); margin-top: 4px;"><strong>Por que um chamado \u00e9 &quot;estourado&quot;?</strong> Usamos os mesmos dados da coluna SLAs do modo lista: API do Jira indica <code>breached</code> para pelo menos um SLA relevante (TTR, FRT ou Time to close). O X vermelho na lista = estourado. Detalhes em <code>ANALISE_SLA_ESTOURADO.md</code>.</p>
+        <p id="feedbackAnalistasEmpty" class="chart-empty">Fa\u00e7a uma busca e use &quot;Feedback por analista&quot; para o compilado (positivos e negativos) ou &quot;Feedback manual&quot; para auditar por ticket.</p>
+        <div id="feedbackAnalistasContent" style="display: none; margin-top: 16px;"></div>
+        <div class="row" style="margin-top: 12px; flex-wrap: wrap; gap: 10px;">
+          <button type="button" id="btnFeedbackAnalistas" class="secondary" disabled title="Feedback por analista: analisa os chamados de cada assignee e gera um \u00fanico feedback com pontos negativos (melhoria) e positivos (fortes).">Feedback por analista (Ollama)</button>
+          <button type="button" id="btnAbrirPainelAuditoria" class="btn-auditar" title="Feedback manual: abre o painel para preencher Cat\u00e1logo, Preenchimento, Solu\u00e7\u00e3o e Coment\u00e1rios por ticket.">Feedback manual (Painel de auditoria)</button>
+        </div>
+      </div>
       <h2 class="chart-section-title">7) Carga e Volume</h2>
       <div class="chart-grid">
         <div class="chart-card"><h3>Tickets por m\u00eas</h3><canvas id="chartVolumePeriod"></canvas></div>
@@ -1067,16 +1322,41 @@ HTML_TEMPLATE = '''
       var c = document.getElementById('chartVolumeAnalyst');
       if (c) window.chartInstances.push(new Chart(c.getContext('2d'), { type: 'bar', data: { labels: volByA.map(function(a) { return a.assignee; }), datasets: [{ label: 'Tickets', data: volByA.map(function(a) { return a.count; }), backgroundColor: '#8c1ce4' }] }, options: { indexAxis: 'y', responsive: true, maintainAspectRatio: true, scales: { x: { beginAtZero: true } }, plugins: { legend: { display: false } } } }));
     }
-    var reopened = stats.reopened || {};
+    var reopened = window.lastReopenedData || stats.reopened || {};
     var reopenedByP = reopened.byPeriod || [];
     var reopenedKeys = reopened.keys || [];
     var reopenedEmptyEl = document.getElementById('chartReaberturaEmpty');
     var reopenedWrapperEl = document.getElementById('chartReaberturaWrapper');
     var reopenedTotalEl = document.getElementById('chartReaberturaTotal');
+    var reopenedListContainer = document.getElementById('reopenedListContainer');
     if (reopenedByP.length > 0 || reopened.total > 0) {
       if (reopenedEmptyEl) reopenedEmptyEl.style.display = 'none';
       if (reopenedWrapperEl) reopenedWrapperEl.style.display = 'block';
       if (reopenedTotalEl) reopenedTotalEl.textContent = 'Total no per\u00edodo: ' + (reopened.total || 0) + ' ticket(s) reaberto(s).';
+      if (reopenedListContainer) {
+        if (reopened.listHtml) {
+          reopenedListContainer.innerHTML = reopened.listHtml;
+          reopenedListContainer.style.display = 'block';
+        } else {
+          reopenedListContainer.innerHTML = '';
+          reopenedListContainer.style.display = 'none';
+        }
+      }
+      var periodStr = reopenedByP.length > 0 ? reopenedByP[0].period : null;
+      if (periodStr && periodStr.length >= 7) {
+        var parts = periodStr.split('-');
+        var py = parseInt(parts[0], 10);
+        var pm = parseInt(parts[1], 10);
+        var lastDay = new Date(py, pm, 0).getDate();
+        window.lastReopenedPeriod = {
+          first: periodStr + '-01',
+          last: periodStr + '-' + (lastDay < 10 ? '0' : '') + lastDay
+        };
+      } else {
+        window.lastReopenedPeriod = null;
+      }
+      var btnReabertos = document.getElementById('btnBuscarReabertos');
+      if (btnReabertos) btnReabertos.style.display = window.lastReopenedPeriod ? '' : 'none';
       destroyChart('chartReabertura');
       var c = document.getElementById('chartReabertura');
       if (c) {
@@ -1098,6 +1378,10 @@ HTML_TEMPLATE = '''
         window.chartInstances.push(chart);
       }
     } else {
+      window.lastReopenedPeriod = null;
+      var btnReabertosEl = document.getElementById('btnBuscarReabertos');
+      if (btnReabertosEl) btnReabertosEl.style.display = 'none';
+      if (reopenedListContainer) { reopenedListContainer.innerHTML = ''; reopenedListContainer.style.display = 'none'; }
       if (reopenedEmptyEl) reopenedEmptyEl.style.display = 'block';
       if (reopenedWrapperEl) reopenedWrapperEl.style.display = 'none';
       if (reopenedTotalEl) reopenedTotalEl.textContent = '';
@@ -1248,6 +1532,83 @@ HTML_TEMPLATE = '''
       renderCharts();
     };
 
+    var btnBuscarReabertosSection = document.getElementById('btnBuscarReabertosSection');
+    var reopenedMonthSelect = document.getElementById('reopenedMonthSelect');
+    var reopenedYearSelect = document.getElementById('reopenedYearSelect');
+    if (btnBuscarReabertosSection && reopenedMonthSelect && reopenedYearSelect) {
+      btnBuscarReabertosSection.onclick = async function() {
+        var m = reopenedMonthSelect.value;
+        var y = reopenedYearSelect.value;
+        if (!m || !y) { msg('Selecione m\u00eas e ano na se\u00e7\u00e3o Reabertura.', 'error'); return; }
+        btnBuscarReabertosSection.disabled = true;
+        msg('Buscando tickets reabertos no per\u00edodo...', 'info');
+        try {
+          var r = await fetch('/api/buscar-reabertos', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ month: parseInt(m, 10), year: parseInt(y, 10) }) });
+          var data = await r.json();
+          if (data.error) { msg(data.error, 'error'); }
+          else {
+            window.lastReopenedData = data;
+            renderCharts();
+            msg((data.total || 0) + ' ticket(s) reaberto(s) no per\u00edodo.', 'success');
+          }
+        } catch (e) { msg('Erro: ' + e.message, 'error'); }
+        btnBuscarReabertosSection.disabled = false;
+      };
+    }
+    var btnBuscarReabertos = document.getElementById('btnBuscarReabertos');
+    if (btnBuscarReabertos) {
+      btnBuscarReabertos.onclick = async function() {
+        var pr = window.lastReopenedPeriod;
+        if (!pr || !pr.first || !pr.last) { msg('Nenhum per\u00edodo de reabertura dispon\u00edvel. Fa\u00e7a uma busca com m\u00eas/ano ou JQL com datas.', 'error'); return; }
+        var reopenedJql = 'status CHANGED FROM ("Done", "Closed", "Resolved") DURING ("' + pr.first + '", "' + pr.last + '")';
+        btnBuscarReabertos.disabled = true;
+        msg('Buscando tickets reabertos no per\u00edodo ' + pr.first + ' a ' + pr.last + '...', 'info');
+        try {
+          var r = await fetch('/buscar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jql: reopenedJql, limit: 5000 }) });
+          var data = await r.json();
+          if (data.error) { msg(data.error, 'error'); }
+          else {
+            msg(data.count + ' ticket(s) reaberto(s) no per\u00edodo. Clique na Key para abrir no Jira.', 'success');
+            window.lastRequestTypeKeys = data.requestTypeKeys || {};
+            window.jiraBaseUrl = data.jiraBaseUrl || '';
+            resultEl.innerHTML = data.html;
+            if (data.notas) {
+              document.querySelectorAll('.nota-cell').forEach(function(td) {
+                var key = td.getAttribute('data-nota-key');
+                if (!key) return;
+                var entry = data.notas[key];
+                var n = entry ? entry.nota : null;
+                var c = (entry && entry.comentario) ? entry.comentario : '';
+                td.textContent = n != null ? String(n) : '\u2014';
+                td.title = c ? (String(n) + ' \u2013 ' + c) : (n != null ? String(n) : '');
+              });
+            }
+            if (document.getElementById('btnExport')) document.getElementById('btnExport').disabled = false;
+            if (document.getElementById('btnNotasRestante')) document.getElementById('btnNotasRestante').disabled = false;
+            if (document.getElementById('btnNotas')) document.getElementById('btnNotas').disabled = false;
+            if (document.getElementById('btnReavaliarNotas')) document.getElementById('btnReavaliarNotas').disabled = false;
+            if (document.getElementById('btnPontosOllama')) document.getElementById('btnPontosOllama').disabled = false;
+            if (document.getElementById('btnFeedbackAnalistas')) document.getElementById('btnFeedbackAnalistas').disabled = false;
+            window.lastStats = data.stats || {};
+            var toolbar = document.getElementById('toolbar');
+            toolbar.style.display = 'flex';
+            var filterRt = document.getElementById('filterRequestType');
+            if (filterRt) {
+              filterRt.innerHTML = '<option value="">Todos</option>';
+              (window.lastStats.requestTypeList || []).forEach(function(rt) { filterRt.appendChild(new Option(rt, rt)); });
+              applyRequestTypeFilter();
+            }
+            window.viewMode = 'lista';
+            document.getElementById('btnViewLista').classList.add('active');
+            document.getElementById('btnViewGrafico').classList.remove('active');
+            document.getElementById('result').style.display = '';
+            document.getElementById('chartContainer').classList.remove('visible');
+          }
+        } catch (e) { msg('Erro: ' + e.message, 'error'); }
+        btnBuscarReabertos.disabled = false;
+      };
+    }
+
     function msg(text, type) {
       messageEl.innerHTML = '<div class="msg ' + (type || 'info') + '">' + text + '</div>';
     }
@@ -1302,6 +1663,7 @@ HTML_TEMPLATE = '''
           document.getElementById('btnNotas').disabled = false;
           if (document.getElementById('btnReavaliarNotas')) document.getElementById('btnReavaliarNotas').disabled = false;
           if (document.getElementById('btnPontosOllama')) document.getElementById('btnPontosOllama').disabled = false;
+          if (document.getElementById('btnFeedbackAnalistas')) document.getElementById('btnFeedbackAnalistas').disabled = false;
           window.lastStats = data.stats || { byRequestType: {}, requestTypeList: [] };
           var toolbar = document.getElementById('toolbar');
           toolbar.style.display = 'flex';
@@ -1574,14 +1936,50 @@ HTML_TEMPLATE = '''
             var summary = escapeHtml((item.summary || '').slice(0, 120));
             var melhoriaList = (item.melhorias || []).map(function(m) { return '<li class="pontos-texto-completo">' + escapeHtml(String(m)) + '</li>'; }).join('');
             var fortesList = (item.fortes || []).map(function(f) { return '<li class="pontos-texto-completo">' + escapeHtml(String(f)) + '</li>'; }).join('');
-            return '<div class="pontos-chamado-block" style="margin-bottom: 20px; padding: 14px; background: #f8f7fa; border-radius: 10px; border: 1px solid #e5e2eb;">' +
-              '<div style="margin-bottom: 8px;"><a href="' + hrefBase + encodeURIComponent(key) + '" target="_blank" rel="noopener" style="font-weight: 700; color: var(--nubank-purple);">' + escapeHtml(key) + '</a>' +
+            var slaBadge = (item.sla_vencido ? ' <span class="sla-vencido-badge">SLA vencido</span>' : '');
+            return '<div class="pontos-chamado-block" data-audit-key="' + escapeHtml(key) + '" data-pontos-key="' + escapeHtml(key) + '" style="margin-bottom: 20px; padding: 14px; background: #f8f7fa; border-radius: 10px; border: 1px solid #e5e2eb;">' +
+              '<div style="margin-bottom: 8px;"><a href="' + hrefBase + encodeURIComponent(key) + '" target="_blank" rel="noopener" style="font-weight: 700; color: var(--nubank-purple);">' + escapeHtml(key) + '</a>' + slaBadge +
+              ' <button type="button" class="btn-auditar" data-audit-key="' + escapeHtml(key) + '">Painel de auditoria</button>' +
+              ' <button type="button" class="secondary btn-reanalisar-pontos" data-issue-key="' + escapeHtml(key) + '" style="font-size: 0.85rem; padding: 4px 10px; margin-left: 6px;">Reanalisar</button>' +
               (summary ? ' &mdash; ' + summary : '') + '</div>' +
               '<div class="pontos-duas-colunas" style="gap: 20px;">' +
-              '<div class="pontos-col-esquerda"><h4 style="color: #dc2626; margin: 0 0 6px 0; font-size: 12pt;">Pontos negativos (melhoria)</h4><ul style="margin: 0; padding-left: 20px; font-size: 12pt; line-height: 1.5;">' + (melhoriaList || '<li>—</li>') + '</ul></div>' +
-              '<div class="pontos-col-direita"><h4 style="color: #059669; margin: 0 0 6px 0; font-size: 12pt;">Pontos positivos (fortes)</h4><ul style="margin: 0; padding-left: 20px; font-size: 12pt; line-height: 1.5;">' + (fortesList || '<li>—</li>') + '</ul></div>' +
+              '<div class="pontos-col-esquerda"><h4 style="color: #dc2626; margin: 0 0 6px 0; font-size: 12pt;">Pontos negativos (melhoria)</h4><ul class="pontos-melhoria-list" style="margin: 0; padding-left: 20px; font-size: 12pt; line-height: 1.5;">' + (melhoriaList || '<li>\u2014</li>') + '</ul></div>' +
+              '<div class="pontos-col-direita"><h4 style="color: #059669; margin: 0 0 6px 0; font-size: 12pt;">Pontos positivos (fortes)</h4><ul class="pontos-fortes-list" style="margin: 0; padding-left: 20px; font-size: 12pt; line-height: 1.5;">' + (fortesList || '<li>\u2014</li>') + '</ul></div>' +
               '</div></div>';
           }).join('');
+          if (!relatorioPorChamado._reanalisarListener) {
+            relatorioPorChamado._reanalisarListener = true;
+            relatorioPorChamado.addEventListener('click', async function(e) {
+              if (!e.target || !e.target.classList || !e.target.classList.contains('btn-reanalisar-pontos')) return;
+              var key = e.target.getAttribute('data-issue-key');
+              if (!key) return;
+              e.target.disabled = true;
+              e.target.textContent = 'Aguarde\u2026';
+              try {
+                var r = await fetch('/api/pontos-reanalisar', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ issue_key: key }) });
+                var data = await r.json();
+                if (data.error) { msg(data.error, 'error'); }
+                else {
+                  var block = e.target.closest ? e.target.closest('.pontos-chamado-block') : relatorioPorChamado.querySelector('[data-pontos-key="' + key.replace(/"/g, '\\"') + '"]');
+                  if (block) {
+                    var mel = (data.melhorias || []).map(function(m) { return '<li class="pontos-texto-completo">' + (m || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</li>'; }).join('');
+                    var fort = (data.fortes || []).map(function(f) { return '<li class="pontos-texto-completo">' + (f || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</li>'; }).join('');
+                    var ulM = block.querySelector('ul.pontos-melhoria-list');
+                    var ulF = block.querySelector('ul.pontos-fortes-list');
+                    if (ulM) ulM.innerHTML = mel || '<li>\u2014</li>';
+                    if (ulF) ulF.innerHTML = fort || '<li>\u2014</li>';
+                    msg('Chamado ' + key + ' reanalisado.', 'success');
+                    if (window.lastPontosMelhoria && window.lastPontosMelhoria.pontosPorIssue) {
+                      var arr = window.lastPontosMelhoria.pontosPorIssue;
+                      for (var i = 0; i < arr.length; i++) { if (arr[i].key === key) { arr[i].melhorias = data.melhorias || []; arr[i].fortes = data.fortes || []; break; } }
+                    }
+                  }
+                }
+              } catch (err) { msg('Erro: ' + err.message, 'error'); }
+              e.target.disabled = false;
+              e.target.textContent = 'Reanalisar';
+            });
+          }
         }
         if (relatorioContent) relatorioContent.style.display = 'block';
         if (ulMelhoria) ulMelhoria.innerHTML = top5M.map(function(x) {
@@ -1614,6 +2012,117 @@ HTML_TEMPLATE = '''
           else { window.lastPontosMelhoria = data; renderPontosCharts(); msg('Pontos extra\u00eddos. Veja os gr\u00e1ficos na se\u00e7\u00e3o 6.', 'success'); }
         } catch (e) { msg('Erro: ' + e.message, 'error'); }
         btnPontosOllama.disabled = false;
+      };
+    }
+    var btnFeedbackAnalistas = document.getElementById('btnFeedbackAnalistas');
+    var feedbackAnalistasEmpty = document.getElementById('feedbackAnalistasEmpty');
+    var feedbackAnalistasContent = document.getElementById('feedbackAnalistasContent');
+    if (btnFeedbackAnalistas) {
+      btnFeedbackAnalistas.onclick = async function() {
+        btnFeedbackAnalistas.disabled = true;
+        if (feedbackAnalistasEmpty) feedbackAnalistasEmpty.style.display = 'block';
+        if (feedbackAnalistasContent) { feedbackAnalistasContent.style.display = 'none'; feedbackAnalistasContent.innerHTML = ''; }
+        msg('Gerando feedback por analista (Ollama). Aguarde.', 'info');
+        try {
+          var r = await fetch('/api/feedback-analistas', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+          var data = await r.json();
+          if (data.error) { msg(data.error, 'error'); }
+          else {
+            var byAnalyst = data.byAnalyst || [];
+            if (byAnalyst.length === 0) { msg('Nenhum analista com tickets no resultado.', 'info'); }
+            else {
+              if (feedbackAnalistasEmpty) feedbackAnalistasEmpty.style.display = 'none';
+              if (feedbackAnalistasContent) {
+                feedbackAnalistasContent.style.display = 'block';
+                function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+                function linkifyKeys(text, jiraBase) {
+                  if (!text || !jiraBase) return esc(text);
+                  var escaped = esc(text);
+                  var re = /\\b([A-Z][A-Z0-9]*-\\d+)\\b/g;
+                  return escaped.replace(re, function(m) { return '<a href="' + jiraBase + '/browse/' + encodeURIComponent(m) + '" target="_blank" rel="noopener" style="color: var(--nubank-purple); text-decoration: underline;">' + m + '</a>'; });
+                }
+                var jiraBase = window.jiraBaseUrl || '';
+                feedbackAnalistasContent.innerHTML = byAnalyst.map(function(a, analystIdx) {
+                  var feedbackUnico = (a.feedback || '').trim();
+                  var details = a.ticketDetails || [];
+                  var ticketsHtml = details.map(function(t, ticketIdx) {
+                    var key = t.key || '';
+                    var keyLink = key && jiraBase ? '<a href="' + jiraBase + '/browse/' + encodeURIComponent(key) + '" target="_blank" rel="noopener">' + esc(key) + '</a>' : esc(key);
+                    var summary = esc((t.summary || '').slice(0, 200)) + (t.summary && t.summary.length > 200 ? '\u2026' : '');
+                    var slaStatus = t.slaStatus || '\u2014';
+                    var slaText = esc((t.slaText || '').slice(0, 300)) + (t.slaText && t.slaText.length > 300 ? '\u2026' : '');
+                    var idComments = 'fb-comments-' + analystIdx + '-' + ticketIdx;
+                    return '<div class="feedback-ticket-row" style="margin-bottom: 12px; padding: 10px; background: #fff; border-radius: 8px; border: 1px solid #e5e2eb;">' +
+                      '<div style="margin-bottom: 4px;"><strong>' + keyLink + '</strong> <span style="color: var(--nubank-text-muted); font-size: 0.9em;">SLA: ' + esc(slaStatus) + '</span></div>' +
+                      '<div style="font-size: 0.95rem; color: #333; margin-bottom: 4px;">' + summary + '</div>' +
+                      (slaText && slaText !== '\u2014' ? '<div style="font-size: 0.85rem; color: var(--nubank-text-muted); margin-bottom: 6px;">' + slaText + '</div>' : '') +
+                      '<button type="button" class="secondary fb-comments-btn" style="font-size: 0.85rem; padding: 4px 10px;" data-issue-key="' + esc(key) + '" data-comments-id="' + idComments + '">Comments</button>' +
+                      '<div id="' + idComments + '" class="fb-comments-box" style="display: none; margin-top: 8px; padding: 8px; background: #f5f4f7; border-radius: 6px; font-size: 0.9rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto;"></div>' +
+                      '</div>';
+                  }).join('');
+                  var blockHeader = '<div style="margin-bottom: 8px; font-weight: 700; color: var(--nubank-purple);">' + esc(a.assignee) + ' <span style="color: var(--nubank-text-muted); font-weight: 500;">(' + (a.ticketCount || 0) + ' chamado(s) no per\u00edodo)</span></div>';
+                  var chamadosDropdown = details.length ? '<details class="fb-chamados-dropdown" style="margin-top: 12px; border: 1px solid #e5e2eb; border-radius: 8px; background: #fff;"><summary style="padding: 10px 12px; cursor: pointer; font-weight: 600; list-style: none;">Chamados (' + details.length + ')</summary><div style="padding: 0 12px 12px 12px; max-height: 400px; overflow-y: auto;">' + ticketsHtml + '</div></details>' : '';
+                  if (feedbackUnico) {
+                    return '<div class="pontos-chamado-block" style="margin-bottom: 20px; padding: 14px; background: #f8f7fa; border-radius: 10px; border: 1px solid #e5e2eb;">' +
+                      blockHeader +
+                      '<p style="margin: 0 0 12px 0; font-size: 12pt; line-height: 1.5;">' + linkifyKeys(feedbackUnico, jiraBase) + '</p>' +
+                      chamadosDropdown + '</div>';
+                  }
+                  var mel = (a.melhorias || []).map(function(m) { return '<li>' + esc(String(m)) + '</li>'; }).join('');
+                  var fort = (a.fortes || []).map(function(f) { return '<li>' + esc(String(f)) + '</li>'; }).join('');
+                  var detailsFallback = a.ticketDetails || [];
+                  var ticketsHtmlFallback = detailsFallback.map(function(t, ticketIdx) {
+                    var key = t.key || '';
+                    var keyLink = key && jiraBase ? '<a href="' + jiraBase + '/browse/' + encodeURIComponent(key) + '" target="_blank" rel="noopener">' + esc(key) + '</a>' : esc(key);
+                    var summary = esc((t.summary || '').slice(0, 200)) + (t.summary && t.summary.length > 200 ? '\u2026' : '');
+                    var slaStatus = t.slaStatus || '\u2014';
+                    var slaText = esc((t.slaText || '').slice(0, 300)) + (t.slaText && t.slaText.length > 300 ? '\u2026' : '');
+                    var idC = 'fb-comments-f-' + analystIdx + '-' + ticketIdx;
+                    return '<div class="feedback-ticket-row" style="margin-bottom: 12px; padding: 10px; background: #fff; border-radius: 8px; border: 1px solid #e5e2eb;">' +
+                      '<div style="margin-bottom: 4px;"><strong>' + keyLink + '</strong> <span style="color: var(--nubank-text-muted); font-size: 0.9em;">SLA: ' + esc(slaStatus) + '</span></div>' +
+                      '<div style="font-size: 0.95rem; color: #333; margin-bottom: 4px;">' + summary + '</div>' +
+                      (slaText && slaText !== '\u2014' ? '<div style="font-size: 0.85rem; color: var(--nubank-text-muted); margin-bottom: 6px;">' + slaText + '</div>' : '') +
+                      '<button type="button" class="secondary fb-comments-btn" style="font-size: 0.85rem; padding: 4px 10px;" data-issue-key="' + esc(key) + '" data-comments-id="' + idC + '">Comments</button>' +
+                      '<div id="' + idC + '" class="fb-comments-box" style="display: none; margin-top: 8px; padding: 8px; background: #f5f4f7; border-radius: 6px; font-size: 0.9rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto;"></div>' +
+                      '</div>';
+                  }).join('');
+                  var chamadosDropdownFallback = ticketsHtmlFallback ? '<details class="fb-chamados-dropdown" style="margin-top: 12px; border: 1px solid #e5e2eb; border-radius: 8px; background: #fff;"><summary style="padding: 10px 12px; cursor: pointer; font-weight: 600; list-style: none;">Chamados (' + detailsFallback.length + ')</summary><div style="padding: 0 12px 12px 12px; max-height: 400px; overflow-y: auto;">' + ticketsHtmlFallback + '</div></details>' : '';
+                  return '<div class="pontos-chamado-block" style="margin-bottom: 20px; padding: 14px; background: #f8f7fa; border-radius: 10px; border: 1px solid #e5e2eb;">' +
+                    '<div style="margin-bottom: 8px; font-weight: 700; color: var(--nubank-purple);">' + esc(a.assignee) + ' <span style="color: var(--nubank-text-muted); font-weight: 500;">(' + (a.ticketCount || 0) + ' chamado(s) no per\u00edodo)</span></div>' +
+                    '<div class="pontos-duas-colunas" style="gap: 20px;">' +
+                    '<div class="pontos-col-esquerda"><h4 style="color: #dc2626; margin: 0 0 6px 0; font-size: 12pt;">Pontos negativos (melhoria)</h4><ul style="margin: 0; padding-left: 20px; font-size: 12pt; line-height: 1.5;">' + (mel || '<li>\u2014</li>') + '</ul></div>' +
+                    '<div class="pontos-col-direita"><h4 style="color: #059669; margin: 0 0 6px 0; font-size: 12pt;">Pontos positivos (fortes)</h4><ul style="margin: 0; padding-left: 20px; font-size: 12pt; line-height: 1.5;">' + (fort || '<li>\u2014</li>') + '</ul></div>' +
+                    '</div>' + chamadosDropdownFallback + '</div>';
+                }).join('');
+              }
+              if (!feedbackAnalistasContent._commentsListener) {
+                feedbackAnalistasContent._commentsListener = true;
+                feedbackAnalistasContent.addEventListener('click', function(e) {
+                  if (!e.target || !e.target.classList || !e.target.classList.contains('fb-comments-btn')) return;
+                  var key = e.target.getAttribute('data-issue-key');
+                  var boxId = e.target.getAttribute('data-comments-id');
+                  if (!key || !boxId) return;
+                  var box = document.getElementById(boxId);
+                  if (!box) return;
+                  if (box.style.display === 'block' && box.textContent) {
+                    box.style.display = 'none';
+                    return;
+                  }
+                  box.textContent = 'Carregando\u2026';
+                  box.style.display = 'block';
+                  fetch('/api/issue-details/' + encodeURIComponent(key))
+                    .then(function(r) { return r.json(); })
+                    .then(function(data) {
+                      box.textContent = (data.comments || '').trim() || '(sem coment\u00e1rios)';
+                    })
+                    .catch(function() { box.textContent = 'Erro ao carregar coment\u00e1rios.'; });
+                });
+              }
+              msg('Feedback por analista gerado. ' + byAnalyst.length + ' analista(s).', 'success');
+            }
+          }
+        } catch (e) { msg('Erro: ' + e.message, 'error'); }
+        btnFeedbackAnalistas.disabled = false;
       };
     }
 
@@ -1662,6 +2171,114 @@ HTML_TEMPLATE = '''
     const slaContent = document.getElementById('slaContent');
     document.querySelector('.sla-close').onclick = () => { slaOverlay.classList.remove('show'); };
     slaOverlay.onclick = (e) => { if (e.target === slaOverlay) slaOverlay.classList.remove('show'); };
+
+    (function() {
+      var auditSidebar = document.getElementById('auditSidebar');
+      var auditTicketId = document.getElementById('auditTicketId');
+      var auditAnalista = document.getElementById('auditAnalista');
+      var auditCatalogo = document.getElementById('auditCatalogo');
+      var auditPreenchimento = document.getElementById('auditPreenchimento');
+      var auditSolucao = document.getElementById('auditSolucao');
+      var auditComentarios = document.getElementById('auditComentarios');
+      var AUDIT_STORAGE_PREFIX = 'l1_audit_';
+      function auditLoadFromStorage(key) {
+        try {
+          var raw = localStorage.getItem(AUDIT_STORAGE_PREFIX + key);
+          if (!raw) return;
+          var d = JSON.parse(raw);
+          if (d.analista != null) auditAnalista.value = d.analista;
+          if (d.catalogo != null) auditCatalogo.value = String(d.catalogo);
+          if (d.preenchimento != null) auditPreenchimento.value = String(d.preenchimento);
+          if (d.solucao != null) auditSolucao.value = String(d.solucao);
+          if (d.comentarios != null) auditComentarios.value = d.comentarios;
+        } catch (e) {}
+      }
+      function auditSaveToStorage(key) {
+        try {
+          localStorage.setItem(AUDIT_STORAGE_PREFIX + key, JSON.stringify({
+            analista: (auditAnalista && auditAnalista.value) ? auditAnalista.value : '',
+            catalogo: auditCatalogo.value,
+            preenchimento: auditPreenchimento.value,
+            solucao: auditSolucao.value,
+            comentarios: auditComentarios.value
+          }));
+        } catch (e) {}
+      }
+      function auditSyncToSheet(key, cb) {
+        if (!key || key === '\u2014') { if (cb) cb(); return; }
+        fetch('/api/auditoria-salvar', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            key: key,
+            analista: (auditAnalista && auditAnalista.value) ? auditAnalista.value : '',
+            catalogo: auditCatalogo.value,
+            preenchimento: auditPreenchimento.value,
+            solucao: auditSolucao.value,
+            comentarios: auditComentarios.value
+          })
+        }).then(function(r) { return r.json(); }).then(function(data) {
+          if (data.error) msg('Planilha: ' + data.error, 'error');
+          if (cb) cb();
+        }).catch(function() { if (cb) cb(); });
+      }
+      function openAuditSidebar(key) {
+        if (!auditSidebar || !key) return;
+        auditTicketId.textContent = key;
+        auditLoadFromStorage(key);
+        auditSidebar.classList.add('show');
+      }
+      function closeAuditSidebar() { if (auditSidebar) auditSidebar.classList.remove('show'); }
+      function getNextAuditKey(currentKey) {
+        var blocks = document.querySelectorAll('#pontosRelatorioPorChamado .pontos-chamado-block[data-audit-key]');
+        for (var i = 0; i < blocks.length; i++) {
+          if ((blocks[i].getAttribute('data-audit-key') || '') === currentKey && i + 1 < blocks.length) {
+            return blocks[i + 1].getAttribute('data-audit-key') || null;
+          }
+        }
+        return null;
+      }
+      if (document.querySelector('.audit-sidebar-close')) document.querySelector('.audit-sidebar-close').onclick = closeAuditSidebar;
+      if (document.getElementById('auditLoadBtn')) document.getElementById('auditLoadBtn').onclick = function() {
+        var key = auditTicketId.textContent;
+        if (key && key !== '—') { auditLoadFromStorage(key); msg('Dados da linha carregados.', 'success'); }
+      };
+      if (document.getElementById('auditSalvar')) document.getElementById('auditSalvar').onclick = function() {
+        var key = auditTicketId.textContent;
+        if (key && key !== '\u2014') {
+          auditSaveToStorage(key);
+          auditSyncToSheet(key, function() { msg('Auditoria salva para ' + key + ' (local e planilha).', 'success'); });
+        }
+      };
+      if (document.getElementById('auditSalvarProximo')) document.getElementById('auditSalvarProximo').onclick = function() {
+        var key = auditTicketId.textContent;
+        if (key && key !== '\u2014') {
+          auditSaveToStorage(key);
+          auditSyncToSheet(key, function() {
+            var next = getNextAuditKey(key);
+            if (next) { openAuditSidebar(next); msg('Salvo na planilha. Próximo: ' + next + '.', 'success'); }
+            else { closeAuditSidebar(); msg('Auditoria salva na planilha. Não há próximo chamado.', 'success'); }
+          });
+        } else {
+          var next = key ? getNextAuditKey(key) : null;
+          if (next) { openAuditSidebar(next); msg('Próximo: ' + next + '.', 'success'); }
+          else { closeAuditSidebar(); msg('Não há próximo chamado.', 'success'); }
+        }
+      };
+      var porChamadoEl = document.getElementById('pontosRelatorioPorChamado');
+      if (porChamadoEl) porChamadoEl.addEventListener('click', function(e) {
+        if (e.target && e.target.classList.contains('btn-auditar')) {
+          e.preventDefault();
+          var k = e.target.getAttribute('data-audit-key');
+          if (k) openAuditSidebar(k);
+        }
+      });
+      var btnAbrirPainelAuditoria = document.getElementById('btnAbrirPainelAuditoria');
+      if (btnAbrirPainelAuditoria) btnAbrirPainelAuditoria.onclick = function() {
+        if (auditSidebar) auditSidebar.classList.add('show');
+        if (auditTicketId) auditTicketId.textContent = '\u2014';
+      };
+    })();
     resultEl.addEventListener('click', async (e) => {
       if (!e.target.classList.contains('btn-sla')) return;
       const key = e.target.getAttribute('data-key');
@@ -1906,11 +2523,8 @@ def buscar():
         stats['csatByRequestType'] = stats_csat_by_request_type(issues, field_ids)
         stats['volumeByPeriod'] = stats_volume_by_period(issues, by_month=True)
         stats['volumeByAnalyst'] = stats_volume_by_analyst(issues)
-        # Gráfico de reabertura: mesmo período do modo lista (mês/ano selecionado)
-        if month is not None and year is not None and int(month) and int(year):
-            stats['reopened'] = stats_reopened_for_period(auth, field_ids, int(month), int(year))
-        else:
-            stats['reopened'] = {'total': 0, 'byPeriod': [], 'keys': []}
+        # Reabertura separada da busca principal: use a seção 4 com período e botão "Buscar reabertos"
+        stats['reopened'] = {'total': 0, 'byPeriod': [], 'keys': [], 'listHtml': ''}
         request_type_keys = {}
         for issue in issues:
             key = issue.get('key')
@@ -1926,6 +2540,57 @@ def buscar():
             'notas': _last_notas,
             'requestTypeKeys': request_type_keys,
             'jiraBaseUrl': JIRA_URL.rstrip('/'),
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+
+@app.route('/api/buscar-reabertos', methods=['POST'])
+def api_buscar_reabertos():
+    """Busca independente de tickets reabertos: JQL status CHANGED FROM (Done, Closed, Resolved) DURING (período). Recebe month, year; retorna total, byPeriod, keys, listHtml."""
+    try:
+        auth = get_auth()
+        data = request.get_json() or {}
+        month = data.get('month')
+        year = data.get('year')
+        if month is None or year is None or not int(month) or not int(year):
+            return jsonify({'error': 'Informe mês e ano.'})
+        month, year = int(month), int(year)
+        field_ids = resolve_custom_fields(auth)
+        reopened = stats_reopened_for_period(auth, field_ids, month, year)
+        base_url = JIRA_URL.rstrip('/')
+        from html import escape as html_escape
+        reopened_issues = reopened.get('issues') or []
+        list_html = ''
+        if reopened_issues:
+            reopened_sla_by_key = _fetch_slas_for_issues(auth, reopened_issues)
+            re_rows = []
+            for issue in reopened_issues:
+                r = get_row_values(issue, field_ids)
+                key = r.get('key', '')
+                link = f'<a href="{base_url}/browse/{key}" target="_blank">{key}</a>' if key else ''
+                summary, desc_plain = get_issue_summary_and_description(issue, field_ids)
+                summary = (summary or '')[:200]
+                desc_display = (desc_plain[:250] + '…') if len(desc_plain) > 250 else (desc_plain or '—')
+                desc_title = desc_plain.replace('"', '&quot;')[:800] if desc_plain else ''
+                fields = issue.get('fields') or {}
+                status_obj = fields.get('status')
+                status_txt = status_obj.get('name', '') if isinstance(status_obj, dict) else (str(status_obj) if status_obj else '')
+                created_txt = get_field_display_value(issue, 'created', field_ids)
+                updated_txt = get_field_display_value(issue, 'updated', field_ids)
+                slas = reopened_sla_by_key.get(key, [])
+                sla_html = _sla_inline_html(slas, html_escape)
+                rt_val = (r.get('Request Type') or '').strip() or '(sem tipo)'
+                sat_val = r.get('Satisfaction') or '—'
+                re_rows.append(
+                    '<tr data-request-type="' + html_escape(rt_val) + '"><td>' + link + '</td><td class="summary-cell">' + html_escape(summary or '—') + '</td><td class="desc-cell" title="' + desc_title + '">' + html_escape(desc_display) + '</td><td>' + (html_escape(str(r.get('Reporter') or ''))) + '</td><td>' + html_escape(status_txt) + '</td><td>' + (html_escape(str(r.get('Assignee') or ''))) + '</td><td>' + html_escape(rt_val) + '</td><td>' + html_escape(created_txt) + '</td><td>' + html_escape(updated_txt) + '</td><td class="satisfaction-cell">' + html_escape(str(sat_val)) + '</td><td class="nota-cell" data-nota-key="' + html_escape(key) + '">—</td><td class="sla-cell">' + sla_html + '</td></tr>'
+                )
+            list_html = '<div class="table-wrap"><table class="reopened-table"><thead><tr><th>Key</th><th>Título</th><th>Descrição</th><th>Reporter</th><th>Status</th><th>Assignee</th><th>Request Type</th><th>Created</th><th>Updated</th><th class="satisfaction-cell">Satisfaction</th><th class="nota-cell">Nota</th><th class="sla-header">SLAs</th></tr></thead><tbody>' + ''.join(re_rows) + '</tbody></table></div><p class="count">Total: ' + str(len(reopened_issues)) + ' ticket(s) reaberto(s) no período.</p>'
+        return jsonify({
+            'total': reopened.get('total', 0),
+            'byPeriod': reopened.get('byPeriod', []),
+            'keys': reopened.get('keys', []),
+            'listHtml': list_html,
         })
     except Exception as e:
         return jsonify({'error': str(e)})
@@ -2061,6 +2726,7 @@ def _save_notas_to_db(notas):
             )
         conn.commit()
         conn.close()
+        _sync_notas_to_sheet(notas)
     except Exception:
         pass
 
@@ -2137,7 +2803,112 @@ def api_pontos_melhoria():
         field_ids = _last_result.get('field_ids') or {}
         sla_by_key = _last_result.get('sla_by_key') or {}
         data = stats_pontos_melhoria_fortes(issues, ollama_url, field_ids, limit=12, auth=auth, sla_by_key=sla_by_key)
+        _sync_pontos_to_sheet(data.get('pontosPorIssue') or [])
         return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/pontos-reanalisar', methods=['POST'])
+def api_pontos_reanalisar():
+    """Reavalia um único chamado via Ollama e retorna novos pontos de melhoria e fortes."""
+    try:
+        global _last_result
+        if not _last_result or not _last_result.get('issues'):
+            return jsonify({'error': 'Faça uma busca antes.'}), 400
+        ollama_url = os.environ.get('OLLAMA_URL', '').strip() or None
+        if not ollama_url:
+            return jsonify({'error': 'Configure OLLAMA_URL no .env.'}), 400
+        body = request.get_json() or {}
+        issue_key = (body.get('issue_key') or body.get('key') or '').strip()
+        if not issue_key:
+            return jsonify({'error': 'Informe issue_key.'}), 400
+        issues = _last_result['issues']
+        issue = next((i for i in issues if (i.get('key') or '').strip() == issue_key), None)
+        if not issue:
+            return jsonify({'error': 'Chamado não está no resultado da busca.'}), 404
+        auth = get_auth()
+        field_ids = _last_result.get('field_ids') or {}
+        sla_by_key = _last_result.get('sla_by_key') or {}
+        comments_text = fetch_issue_comments_text(auth, issue_key, max_comments=20) if auth else ''
+        out = get_issue_pontos_ollama(
+            issue, ollama_url, field_ids,
+            comments_text=comments_text or None, auth=auth, sla_by_key=sla_by_key, mode=None
+        )
+        summary, _ = get_issue_summary_and_description(issue, field_ids)
+        summary = ((summary or '').strip() or '(sem título)')[:200]
+        return jsonify({
+            'key': issue_key,
+            'summary': summary,
+            'melhorias': out.get('melhorias') or [],
+            'fortes': out.get('fortes') or [],
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/feedback-analistas', methods=['POST'])
+def api_feedback_analistas():
+    """Agrupa o resultado da busca por analista (Assignee) e chama Ollama para feedback consolidado: melhoria e fortes por analista (mesmos critérios de Extrair pontos)."""
+    try:
+        global _last_result
+        if not _last_result or not _last_result.get('issues'):
+            return jsonify({'error': 'Faça uma busca antes.'}), 400
+        ollama_url = os.environ.get('OLLAMA_URL', '').strip() or None
+        if not ollama_url:
+            return jsonify({'error': 'Configure OLLAMA_URL no .env.'}), 400
+        auth = get_auth()
+        issues = _last_result['issues']
+        field_ids = _last_result.get('field_ids') or {}
+        sla_by_key = _last_result.get('sla_by_key') or {}
+        data = stats_feedback_analistas_ollama(issues, ollama_url, field_ids, auth=auth, sla_by_key=sla_by_key, max_analysts=200)
+        _sync_feedback_analistas_to_sheet(data.get('byAnalyst') or [])
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/issue-details/<issue_key>')
+def api_issue_details(issue_key):
+    """Retorna resumo, SLAs e comments de um ticket (para exibir ao clicar em Comments no feedback por analista)."""
+    try:
+        global _last_result
+        key = (issue_key or '').strip()
+        if not key:
+            return jsonify({'error': 'Key inválida.'}), 400
+        auth = get_auth()
+        issues = (_last_result or {}).get('issues') or []
+        sla_by_key = (_last_result or {}).get('sla_by_key') or {}
+        field_ids = (_last_result or {}).get('field_ids') or {}
+        issue = next((i for i in issues if (i.get('key') or '').strip() == key), None)
+        summary = ''
+        sla_text = ''
+        if issue:
+            summary, _ = get_issue_summary_and_description(issue, field_ids)
+            summary = ((summary or '').strip() or '(sem título)')[:500]
+            slas = sla_by_key.get(key) or []
+            sla_text = _format_sla_list_for_ollama(slas, only_relevant=False)[:600] if slas else '—'
+        comments = fetch_issue_comments_text(auth, key, max_comments=30) or '' if auth else ''
+        return jsonify({'key': key, 'summary': summary, 'slaText': sla_text, 'comments': comments})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auditoria-salvar', methods=['POST'])
+def api_auditoria_salvar():
+    """Salva feedback manual do Painel de Auditoria na planilha Google (aba Auditoria)."""
+    try:
+        body = request.get_json() or {}
+        key = (body.get('key') or body.get('issue_key') or '').strip()
+        if not key:
+            return jsonify({'error': 'Informe key (ticket).'}), 400
+        analista = body.get('analista', body.get('Analista', ''))
+        catalogo = body.get('catalogo', body.get('Catálogo ou Categorização', ''))
+        preenchimento = body.get('preenchimento', body.get('Preenchimento do Ticket', ''))
+        solucao = body.get('solucao', body.get('Solução Aplicada', ''))
+        comentarios = body.get('comentarios', body.get('comentarios', ''))
+        _sync_auditoria_to_sheet(key, analista, catalogo, preenchimento, solucao, comentarios)
+        return jsonify({'ok': True, 'message': 'Auditoria salva na planilha.'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

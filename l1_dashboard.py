@@ -488,8 +488,8 @@ def fetch_issue_sla(auth, issue_key):
 
 
 # SLAs que contam para "fora do SLA" (análises). Inclui variações em inglês e português para primeira resposta e resolução.
+# EXCEÇÃO: "Time to close after resolution" (ex.: within 24h) é IGNORADO em todo o sistema devido a falha na automação do Jira.
 _SLA_NAMES_RELEVANT = (
-    'time to close after resolution',
     'time to first response',
     'time to resolution',
     'first response',
@@ -498,13 +498,16 @@ _SLA_NAMES_RELEVANT = (
     'resolução',
     'resolution',
 )
+_SLA_NAMES_IGNORE = ('time to close after resolution',)  # ignorar por falha na automação Jira
 
 
 def _sla_name_is_relevant(name):
-    """True apenas para os SLAs que definem se o chamado está fora do SLA (Time to close after resolution, Time to first response, Time to resolution)."""
+    """True apenas para os SLAs que definem se o chamado está fora do SLA (FRT, TTR). Time to close after resolution é ignorado."""
     if not name or not isinstance(name, str):
         return False
     n = name.lower().strip()
+    if any(ign in n for ign in _SLA_NAMES_IGNORE):
+        return False
     return any(r in n for r in _SLA_NAMES_RELEVANT)
 
 
@@ -969,6 +972,33 @@ def get_issue_note_from_ollama(issue, ollama_url, model=None, field_ids=None, co
     - /api 404: só /v1/chat/completions existe (já tentamos os três endpoints).
     O backend reavalia em loop até todos terem nota; não há fallback.
     """
+    FEEDBACK_SAT_MENOR_4 = (
+        'Analista deve reverter o atendimento e atender com mais ênfase na solução do problema, '
+        'e entender melhor a causa raiz com uma comunicação mais efetiva.'
+    )
+
+    def _satisfaction_menor_que_4():
+        sat = get_satisfaction_numeric(issue, field_ids)
+        if sat is not None:
+            return sat < 4
+        row = get_row_values(issue, field_ids or {})
+        raw = (row.get('Satisfaction') or '').strip()
+        if raw and str(raw).isdigit():
+            try:
+                n = int(raw)
+                return 1 <= n <= 5 and n < 4
+            except (ValueError, TypeError):
+                pass
+        return False
+
+    def _apply_satisfaction_feedback(res):
+        if not res or not res.get('nota'):
+            return res
+        if _satisfaction_menor_que_4():
+            res = dict(res)
+            res['comentario'] = FEEDBACK_SAT_MENOR_4
+        return res
+
     def _fail(comentario):
         return {'nota': None, 'comentario': comentario}
 
@@ -1005,15 +1035,20 @@ def get_issue_note_from_ollama(issue, ollama_url, model=None, field_ids=None, co
     # Cenário 2: SLA CRÍTICO. Foco no atendimento e nas ações do Assignee; evitar linguagem muito técnica.
     prompt = (
         'Você é um QA que avalia o atendimento prestado pelo analista (Assignee). '
-        'Reporter = quem foi atendido; Assignee = quem atende. O resumo deve descrever as AÇÕES do Assignee (verbo no ativo), não do Reporter.\n\n'
-        'LÍNGUA E GRAMÁTICA: Responda sempre em português do Brasil (pt-BR), com gramática e conjugação verbal corretas, de forma natural e clara. '
-        'O Assignee é quem EXECUTA a ação. Use sempre: "X atendeu", "X prestou atendimento", "X respondeu", "X resolveu". '
-        'NUNCA escreva "X atendido" (errado: significaria que X foi atendido). NUNCA "atendido o assignee" ou "atended" (inglês). '
-        'Exemplos corretos: "Vini Reis atendeu bem ao usuário Aaron Thornton"; "Jilcimar atendeu o chamado"; "Gabriel Silva prestou atendimento ao Nubank Team". '
+        'REGRA OBRIGATÓRIA: O Assignee NUNCA pode ser atendido — é ele quem atende. Reporter = quem foi atendido; Assignee = quem atende. '
+        'O resumo deve descrever as AÇÕES do Assignee (verbo no ativo), não do Reporter.\n\n'
+        'PROIBIDO (erros graves): '
+        '"X atendeu o Assignee" ou "atendeu o analista" (o Assignee é quem atende, nunca o objeto de "atender"); '
+        '"X atendido" ou "X atendido e prestou atendimento" quando X é o analista (o analista é quem atendeu, nunca "foi atendido"); '
+        '"atended" (inglês). '
+        'Correto: "O analista atendeu bem"; "Atendeu o solicitante e resolveu"; "Prestou atendimento no prazo". '
+        'LÍNGUA E GRAMÁTICA: Responda em pt-BR, com gramática e conjugação corretas. '
+        'O Assignee é sempre SUJEITO da ação: "atendeu", "prestou atendimento", "respondeu", "resolveu". '
         'Concordância, acentuação e pontuação em pt-BR.\n\n'
         'Foque no que o Assignee fez: respondeu no prazo? Foi claro? Resolveu? Marcou o Reporter (@Reporter)? '
-        'Use os dados: Satisfaction (1-5), SLA (Cumprido/Estourado), Comments do Assignee.\n\n'
-        'Resposta em UMA LINHA: N - resumo em até 10 palavras. Ex: 4 - Atendeu bem, solução clara, marcou o Reporter.\n\n'
+        'Use os dados: Satisfaction (1-5), SLA (Cumprido/Estourado), Comments do Assignee. '
+        'REGRA: Satisfaction 1, 2 ou 3 = insatisfação (NUNCA diga que o Reporter está satisfeito). Só 4 ou 5 = satisfeito.\n\n'
+        'Resposta em UMA LINHA: N - resumo em até 10 palavras. Ex: 4 - Atendeu bem, solução clara. Ex: 1 - Insatisfação, rever atendimento.\n\n'
         'Dados do chamado (Assignee, Comments, TTR, FRT, Satisfaction):\n' + context
     )
     max_retries = 4  # 5 tentativas por endpoint para obter nota 1–5 (sem fallback)
@@ -1047,7 +1082,7 @@ def get_issue_note_from_ollama(issue, ollama_url, model=None, field_ids=None, co
                     if content:
                         result = _parse_ollama_nota_response(content)
                         if result and result.get('nota') and 1 <= result.get('nota') <= 5:
-                            return result
+                            return _apply_satisfaction_feedback(result)
                 if attempt < max_retries:
                     time.sleep(1.5)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -1081,7 +1116,7 @@ def get_issue_note_from_ollama(issue, ollama_url, model=None, field_ids=None, co
                     if content:
                         result = _parse_ollama_nota_response(content)
                         if result and result.get('nota') and 1 <= result.get('nota') <= 5:
-                            return result
+                            return _apply_satisfaction_feedback(result)
                 if attempt < max_retries:
                     time.sleep(1.5)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -1121,7 +1156,7 @@ def get_issue_note_from_ollama(issue, ollama_url, model=None, field_ids=None, co
                         if content:
                             result = _parse_ollama_nota_response(content)
                             if result and result.get('nota') and 1 <= result.get('nota') <= 5:
-                                return result
+                                return _apply_satisfaction_feedback(result)
                 if attempt < max_retries:
                     time.sleep(1.5)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -1400,12 +1435,45 @@ def _parse_pontos_ollama_response(content):
     fortes = [f for f in fortes if not ('ttr' in nf(f) and 'frt' in nf(f))]  # nunca "TTR/FRT" numa única linha
     # Remover contradições: mesma métrica não pode aparecer nos dois lados (ex.: SLA estourado em melhoria e "dentro do SLA" em fortes)
     melhorias, fortes = _remove_contradictions(melhorias, fortes)
+    # Segunda passada: se a resposta tem conteúdo mas não veio no formato "Melhoria:/Forte:", extrair frases úteis por palavras-chave (só do que o modelo escreveu, sem fallback genérico)
+    if not melhorias and not fortes and len(content) > 80:
+        nf = _normalize_for_contradiction
+        for part in re.split(r'[.\n]', content):
+            part = part.strip()
+            if not part or len(part) < 20 or len(part) > 400:
+                continue
+            if _is_intro_line(part) or not _is_sensible_ponto(part):
+                continue
+            part_lower = nf(part)
+            if _is_rule_or_wrong_category(part, for_melhoria=True) or _looks_like_forte(part):
+                pass
+            elif any(x in part_lower for x in ('estourado', 'estourou', 'vencido', 'fora do prazo', 'sla nao', 'sla não', 'atraso', 'demora')):
+                if not _is_nonsense_or_metadata_ponto(part):
+                    melhorias.append(part[:450])
+            if any(x in part_lower for x in ('dentro do prazo', 'sla cumprido', 'comunicação', 'comunicacao', 'resolução', 'resolucao', 'clareza', 'respondeu', 'feedback')):
+                if not _looks_like_melhoria(part) and not _is_rule_or_wrong_category(part, for_melhoria=False) and not _is_nonsense_or_metadata_ponto(part):
+                    if 'estourado' not in part_lower and 'vencido' not in part_lower:
+                        fortes.append(part[:450])
+        melhorias = [x for x in melhorias[:5] if not _is_nonsense_or_metadata_ponto(x) and not _looks_like_forte(x)]
+        fortes = [f for f in fortes[:5] if not _is_nonsense_or_metadata_ponto(f) and not _looks_like_melhoria(f)]
+        fortes = [f for f in fortes if 'estourado' not in nf(f) and 'vencido' not in nf(f)]
+        melhorias, fortes = _remove_contradictions(melhorias, fortes)
     return {'melhorias': melhorias[:5], 'fortes': fortes[:5]}
+
+
+# Fallback quando Satisfaction (Jira) < 4: não usar Ollama; usar este texto fixo. Manter sempre este texto.
+# Quando SLA estourado, o caller (stats_pontos_melhoria_fortes) define sla_vencido no item para o relatório
+# exibir o badge "SLA vencido" ao lado do chamado; aqui acrescentamos também "O analista deve cumprir o SLA." na lista.
+_PONTOS_FALLBACK_SAT_MENOR_4 = (
+    'Analista deve reverter o atendimento e atender com mais ênfase na solução do problema, '
+    'e entender melhor a causa raiz com uma comunicação mais efetiva.'
+)
 
 
 def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comments_text=None, auth=None, sla_by_key=None, mode=None, confluence_text=None):
     """
     Chama Ollama para extrair pontos de melhoria e/ou pontos fortes do atendimento.
+    REGRA: Se Satisfaction (campo Jira) < 4, NÃO usa Ollama — retorna fallback fixo. O resto usa Ollama.
     mode='melhoria': só pontos de melhoria (boas práticas para melhorar resultados negativos).
     mode='fortes': só pontos fortes (o que foi feito de bom).
     mode=None: ambos (comportamento anterior).
@@ -1415,9 +1483,26 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
     """
     if not ollama_url or not ollama_url.strip():
         return {'melhorias': [], 'fortes': []}
-    base = ollama_url.strip().rstrip('/')
-    context = _issue_context_full_for_pontos(issue, field_ids or {}, comments_text)
     key = issue.get('key')
+    field_ids = field_ids or {}
+    # Satisfaction < 4 → usar regra de fallback (não chamar Ollama)
+    sat = get_satisfaction_numeric(issue, field_ids)
+    if sat is None:
+        row = get_row_values(issue, field_ids)
+        raw = (row.get('Satisfaction') or '').strip()
+        if raw and str(raw).replace('.', '').isdigit():
+            try:
+                sat = int(float(raw))
+            except (ValueError, TypeError):
+                pass
+    if sat is not None and sat < 4:
+        melhorias = [_PONTOS_FALLBACK_SAT_MENOR_4]
+        if key and sla_by_key is not None and _issue_sla_breached(key, sla_by_key):
+            melhorias.insert(0, 'O analista deve cumprir o SLA.')
+        return {'melhorias': melhorias[:5], 'fortes': []}
+
+    base = ollama_url.strip().rstrip('/')
+    context = _issue_context_full_for_pontos(issue, field_ids, comments_text)
     if key and sla_by_key is not None:
         sla_list = sla_by_key.get(key)
         if sla_list:
@@ -1429,30 +1514,41 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
     context = context[:3800]
     regra_reporter_assignee = (
         'Regra: Reporter = quem foi atendido; Assignee = analista que atende. '
-        'Ao falar do Assignee, use verbo no ativo: "atendeu", "prestou atendimento", "respondeu". NUNCA "X atendido" (errado) nem "atended" (inglês). '
-        'Refira-se ao Reporter como quem recebeu o atendimento.\n\n'
+        'NÃO cite nomes (ex.: Vini Reis, Gabriel Silva); use apenas "o analista", "o Assignee", "quem atendeu", "o atendente", "o solicitante". '
+        'PROIBIDO: "X atendeu o Assignee" ou "X atendido". Correto: "O analista atendeu"; "Prestou atendimento no prazo". '
+        'Não repita a mesma informação; cada ponto deve trazer uma ideia distinta.\n\n'
+    )
+    criterios_analise = (
+        'FORMATO DE ANÁLISE: Avalie o ticket em quatro dimensões e detalhe o que negativou (ponto de melhoria) e o que foi positivo (ponto forte):\n'
+        '1) Resolução do Problema — a solução foi dada corretamente? Resposta clara ao Reporter?\n'
+        '2) SLA — cumprido ou estourado? Se o SLA estourou, isso SEMPRE gera ponto de melhoria (não pode ser só ponto forte).\n'
+        '3) Comunicação — contato constante, feedback, clareza com o Reporter?\n'
+        '4) Satisfação — mede o campo do Jira Satisfaction (escala 1 a 5). Satisfaction menor que 4 (1, 2 ou 3) = ponto de melhoria; Satisfaction maior que 3 (4 ou 5) = ponto forte. Se Satisfaction = 0 ou não informado, NÃO mencione satisfação nos pontos (ignore essa dimensão).\n'
+        'Detalhe: o que entra como melhoria (negativo) e o que entra como forte (positivo), com base nos dados do chamado (SLA, Comments, Satisfaction 1-5 quando preenchido).\n\n'
     )
     pt_grammar = (
-        'Responda sempre em português do Brasil (pt-BR), com gramática e conjugação verbal corretas, de forma natural e clara. '
-        'Concordância, acentuação e pontuação em pt-BR. Assignee = sujeito da ação: use "atendeu", "prestou atendimento"; NUNCA "atendido" para o analista nem "atended" (inglês). '
+        'Responda em pt-BR, com gramática e conjugação corretas. '
+        'Assignee = sempre sujeito: "atendeu", "prestou atendimento". NUNCA nomes; NUNCA "atendeu o Assignee". Sem informações repetidas.\n\n'
     )
     if mode == 'melhoria':
         prompt = (
             'Responda em português brasileiro. Use APENAS os dados abaixo (não invente). Analise a base de conhecimento (Jira + Confluence) e só então redija os pontos.\n\n'
             + regra_reporter_assignee +
-            'Foque no ATENDIMENTO e nas AÇÕES do Assignee (analista), não no Reporter. Evite linguagem muito técnica; use termos simples: resposta, comunicação, solução, prazo, clareza. '
+            criterios_analise +
+            'Foque no ATENDIMENTO e nas AÇÕES do Assignee (analista). Evite linguagem muito técnica; use termos simples: resposta, comunicação, solução, prazo, clareza. '
             + pt_grammar + '\n\n'
-            'Chamado com Satisfaction baixo (1-3) e SLA vencido. Redija até 5 PONTOS DE MELHORIA concretos: o que o Assignee poderia ter feito de diferente no atendimento para feedback positivo do Reporter.\n\n'
-            'OBRIGATÓRIO: não escreva frase introdutória. Saída APENAS linhas no formato "Melhoria: <frase concreta>." uma por linha. Frases completas, sem cortar no meio. Baseie-se nos comentários e ações do Assignee. Proibido comentário vago ou genérico.\n\n'
+            'Redija até 5 PONTOS DE MELHORIA concretos (o que negativou): o que o Assignee poderia ter feito de diferente. Se o SLA estourou, inclua como melhoria. Se Satisfaction entre 1 e 3, considere como melhoria. Se Satisfaction = 0 ou não informado, não mencione Satisfação. Baseie-se em Resolução do Problema, SLA, Comunicação e Satisfação (1-5 quando preenchido).\n\n'
+            'OBRIGATÓRIO: não escreva frase introdutória. Saída APENAS linhas no formato "Melhoria: <frase concreta>." uma por linha. Frases completas, sem cortar no meio. Proibido comentário vago ou genérico.\n\n'
             'Base de conhecimento:\n' + context
         )
     elif mode == 'fortes':
         prompt = (
             'Responda em português brasileiro. Use APENAS os dados abaixo (não invente). Analise a base de conhecimento e só então redija os pontos.\n\n'
             + regra_reporter_assignee +
-            'Foque no ATENDIMENTO e nas AÇÕES do Assignee (analista), não no Reporter. Evite linguagem muito técnica; use termos simples: resposta, comunicação, solução, prazo, clareza. '
+            criterios_analise +
+            'Foque no ATENDIMENTO e nas AÇÕES do Assignee (analista). Evite linguagem muito técnica; use termos simples: resposta, comunicação, solução, prazo, clareza. '
             + pt_grammar + '\n\n'
-            'Chamado com Satisfaction=5 e dentro do SLA. Redija até 5 pontos positivos concretos do que o Assignee fez bem no atendimento.\n\n'
+            'Redija até 5 pontos positivos (pontos fortes) concretos do que o Assignee fez bem. Considere Resolução do Problema, SLA (se cumprido), Comunicação e Satisfação (se 4 ou 5, considere ponto forte). Se Satisfaction = 0 ou não informado, não mencione Satisfação. Só inclua como forte o que de fato foi positivo nos dados do chamado.\n\n'
             'OBRIGATÓRIO: não escreva frase introdutória. Saída APENAS linhas no formato "Forte: <frase concreta>." uma por linha. Frases completas, sem cortar no meio. Proibido comentário vago ou genérico.\n\n'
             'Base de conhecimento:\n' + context
         )
@@ -1460,7 +1556,8 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
         prompt = (
             'Responda em português brasileiro. Use APENAS os dados abaixo (não invente). Analise a base e só então redija as listas.\n\n'
             + regra_reporter_assignee +
-            'Foque no ATENDIMENTO e nas AÇÕES do Assignee (analista), não no Reporter. Evite linguagem muito técnica; use termos simples sobre atendimento. '
+            criterios_analise +
+            'Avalie o ticket em Resolução do Problema, SLA, Comunicação e Satisfação (1-5 quando preenchido: < 4 = melhoria; > 3 = forte). Se Satisfaction = 0 ou não informado, não mencione Satisfação. SLA estourado = melhoria; Satisfaction 1, 2 ou 3 = melhoria; 4 ou 5 = forte. '
             + pt_grammar + '\n\n'
             'Saída APENAS linhas no formato "Melhoria: <frase>." ou "Forte: <frase>." até 5 de cada. Frases completas, sem cortar no meio. Não escreva frase introdutória. Cada ponto concreto e específico (proibido vago ou genérico).\n\n'
             'Base de conhecimento:\n' + context
@@ -1473,10 +1570,25 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
                 return out
         return None
 
+    MELHORIA_SLA_ESTOURADO = 'O analista deve cumprir o SLA.'
+
     def ensure_pontos_never_empty(out, mode):
         """Retorna o resultado sem preencher com texto genérico (sem fallback)."""
         if not out:
             out = {'melhorias': [], 'fortes': []}
+        return out
+
+    def apply_sla_estourado_feedback(out):
+        """Quando SLA estourado, inclui em melhorias a resposta fixa para SLA."""
+        if not out or not key or sla_by_key is None:
+            return out
+        if not _issue_sla_breached(key, sla_by_key):
+            return out
+        mel = list(out.get('melhorias') or [])
+        if MELHORIA_SLA_ESTOURADO not in mel:
+            mel.insert(0, MELHORIA_SLA_ESTOURADO)
+        out = dict(out)
+        out['melhorias'] = mel[:5]
         return out
 
     # Mesma lógica de get_issue_note_from_ollama: modelos, ordem dos endpoints (generate → chat → v1); timeout maior para pontos (contexto maior)
@@ -1501,8 +1613,8 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
             seen.add(n)
             models_to_try.append(n)
 
-    max_retries = 4
-    req_timeout = 180
+    max_retries = 6
+    req_timeout = 240
     for m in models_to_try:
         if not m:
             continue
@@ -1527,7 +1639,7 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
                     content = (data.get('response') or '').strip()
                     result = parse_content(content)
                     if result:
-                        return ensure_pontos_never_empty(result, mode)
+                        return apply_sla_estourado_feedback(ensure_pontos_never_empty(result, mode))
                 if attempt < max_retries:
                     time.sleep(1.5)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -1559,7 +1671,7 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
                     content = (msg.get('content') or '').strip()
                     result = parse_content(content)
                     if result:
-                        return ensure_pontos_never_empty(result, mode)
+                        return apply_sla_estourado_feedback(ensure_pontos_never_empty(result, mode))
                 if attempt < max_retries:
                     time.sleep(1.5)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -1597,7 +1709,7 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
                         content = content.strip()
                         result = parse_content(content)
                         if result:
-                            return ensure_pontos_never_empty(result, mode)
+                            return apply_sla_estourado_feedback(ensure_pontos_never_empty(result, mode))
                 if attempt < max_retries:
                     time.sleep(1.5)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
@@ -1608,7 +1720,7 @@ def get_issue_pontos_ollama(issue, ollama_url, field_ids=None, model=None, comme
                 if attempt < max_retries:
                     time.sleep(1.5)
                 break
-    return ensure_pontos_never_empty({'melhorias': [], 'fortes': []}, mode)
+    return apply_sla_estourado_feedback(ensure_pontos_never_empty({'melhorias': [], 'fortes': []}, mode))
 
 
 def stats_pontos_melhoria_fortes(issues, ollama_url, field_ids, limit=12, auth=None, sla_by_key=None):
@@ -1706,7 +1818,7 @@ def stats_pontos_melhoria_fortes(issues, ollama_url, field_ids, limit=12, auth=N
         confluence_text = fetch_confluence_for_issue(issue, auth, field_ids) if auth else ''
         out = get_issue_pontos_ollama(issue, ollama_url, field_ids, comments_text=comments_text, auth=auth, sla_by_key=sla_by_key, mode='melhoria', confluence_text=confluence_text)
         summary = ((issue.get('fields') or {}).get('summary') or '').strip() or '(sem título)'
-        pontos_por_issue.append({'key': key, 'summary': summary[:200], 'melhorias': list(out.get('melhorias') or []), 'fortes': []})
+        pontos_por_issue.append({'key': key, 'summary': summary[:200], 'melhorias': list(out.get('melhorias') or []), 'fortes': [], 'sla_vencido': _issue_sla_breached(key, sla_by_key)})
         for m in (out.get('melhorias') or []):
             if not _is_sensible_ponto(m):
                 continue
@@ -1727,7 +1839,7 @@ def stats_pontos_melhoria_fortes(issues, ollama_url, field_ids, limit=12, auth=N
         confluence_text = fetch_confluence_for_issue(issue, auth, field_ids) if auth else ''
         out = get_issue_pontos_ollama(issue, ollama_url, field_ids, comments_text=comments_text, auth=auth, sla_by_key=sla_by_key, mode='fortes', confluence_text=confluence_text)
         summary = ((issue.get('fields') or {}).get('summary') or '').strip() or '(sem título)'
-        pontos_por_issue.append({'key': key, 'summary': summary[:200], 'melhorias': [], 'fortes': list(out.get('fortes') or [])})
+        pontos_por_issue.append({'key': key, 'summary': summary[:200], 'melhorias': [], 'fortes': list(out.get('fortes') or []), 'sla_vencido': _issue_sla_breached(key, sla_by_key)})
         for f in (out.get('fortes') or []):
             if not _is_sensible_ponto(f):
                 continue
@@ -1750,6 +1862,184 @@ def stats_pontos_melhoria_fortes(issues, ollama_url, field_ids, limit=12, auth=N
         'melhoriaByRequestType': melhoria_by_rt,
         'pontosPorIssue': pontos_por_issue,
     }
+
+
+def _analyst_tickets_context(issues_list, field_ids, sla_by_key):
+    """Monta contexto resumido dos tickets de um analista para feedback consolidado (key, summary, Satisfaction, SLA)."""
+    sla_by_key = sla_by_key or {}
+    lines = []
+    for issue in (issues_list or [])[:30]:
+        row = get_row_values(issue, field_ids or {})
+        key = row.get('key') or issue.get('key') or ''
+        if not key:
+            continue
+        summary, _ = get_issue_summary_and_description(issue, field_ids)
+        summary = ((summary or '').strip() or '(sem título)')[:200]
+        sat = row.get('Satisfaction', '—')
+        slas = sla_by_key.get(key) or []
+        sla_status = '—'
+        if slas:
+            breached = _issue_sla_breached(key, sla_by_key)
+            sla_status = 'Estourado' if breached else 'Cumprido'
+        lines.append(f'Chamado {key}: {summary} | Satisfaction: {sat} | SLA: {sla_status}')
+    return '\n'.join(lines) if lines else ''
+
+
+def _ollama_feedback_analista_single(prompt, ollama_url, base_url=None):
+    """Chama Ollama com prompt de feedback consolidado; retorna texto da resposta ou ''."""
+    if not ollama_url or not ollama_url.strip():
+        return ''
+    base = (ollama_url or '').strip().rstrip('/')
+    timeout = 180
+    models_to_try = ['llama3.2', 'llama3.1', 'llama3', 'qwen2.5:0.5b', 'qwen2.5', 'mistral', 'gemma2:2b']
+    try:
+        r = requests.get(f'{base}/api/tags', timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            installed = [(x.get('name') or x.get('model') or '').strip() for x in (data.get('models') or []) if (x.get('name') or x.get('model') or '').strip()]
+            if installed:
+                models_to_try = list(dict.fromkeys(installed + models_to_try))
+    except Exception:
+        pass
+    for m in models_to_try:
+        if not m:
+            continue
+        for endpoint, payload in [
+            ('/api/generate', {'model': m, 'prompt': prompt, 'stream': False, 'options': {'temperature': 0, 'num_predict': 1024}}),
+            ('/api/chat', {'model': m, 'messages': [{'role': 'user', 'content': prompt}], 'stream': False, 'options': {'temperature': 0, 'num_predict': 1024}}),
+        ]:
+            try:
+                r = requests.post(f'{base}{endpoint}', json=payload, timeout=timeout)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if endpoint == '/api/generate':
+                    content = (data.get('response') or '').strip()
+                else:
+                    content = ((data.get('message') or {}).get('content') or '').strip()
+                if content:
+                    return content
+            except Exception:
+                continue
+    return ''
+
+
+def stats_feedback_analistas_ollama(issues, ollama_url, field_ids, auth=None, sla_by_key=None, max_analysts=15):
+    """
+    Feedback mensal por analista (assignee) via Ollama, no papel de QA.
+    Agrupa por Assignee; para cada analista, analisa os chamados em âmbito geral e devolve UM ÚNICO
+    feedback em uma frase, considerando: CSAT médio nos chamados avaliados, cumprimento de prazos (SLA)
+    e linguagem clara, formal e objetiva.
+    Retorna: { 'byAnalyst': [ { assignee, ticketCount, feedback, melhorias, fortes } ] }.
+    """
+    from collections import defaultdict
+    import time
+    if not ollama_url or not ollama_url.strip():
+        return {'byAnalyst': []}
+    sla_by_key = sla_by_key or {}
+    by_assignee = defaultdict(list)
+    for issue in (issues or []):
+        row = get_row_values(issue, field_ids or {})
+        name = (row.get('Assignee') or '').strip() or 'Unassigned'
+        if name and name != 'Unassigned':
+            by_assignee[name].append(issue)
+    criterios_base = (
+        'NUNCA cite nomes de pessoas; use "o analista". '
+        'Avalie como QA: UM ÚNICO feedback em UMA ÚNICA FRASE com o que melhorar e o que está bom. '
+        'Saída: APENAS essa frase, sem títulos nem listas.\n\n'
+    )
+    result = []
+    limit = max_analysts if max_analysts and max_analysts > 0 else len(by_assignee)
+    analysts = sorted(by_assignee.keys(), key=lambda a: -len(by_assignee[a]))[:limit]
+    for idx, assignee in enumerate(analysts):
+        tickets = by_assignee[assignee]
+        if not tickets:
+            continue
+        context = _analyst_tickets_context(tickets, field_ids, sla_by_key)
+        if not context.strip():
+            continue
+        context = context[:3500]
+        # CSAT médio (Satisfaction 1-5) nos chamados avaliados
+        sat_values = []
+        for t in tickets:
+            s = get_satisfaction_numeric(t, field_ids)
+            if s is not None and 1 <= s <= 5:
+                sat_values.append(s)
+        avg_csat = sum(sat_values) / len(sat_values) if sat_values else None
+        csat_ok = avg_csat is not None and avg_csat > 3
+        # Cumprimento de prazos: só chamados com X na coluna SLAs (estourado). Muitos estourados = ponto de atenção.
+        sla_estourados = sum(1 for t in tickets if t.get('key') and _issue_sla_breached(t['key'], sla_by_key))
+        sla_cumpridos = len(tickets) - sla_estourados
+        muitos_estourados = sla_estourados > sla_cumpridos
+        keys_estourados = [t['key'] for t in tickets if t.get('key') and _issue_sla_breached(t['key'], sla_by_key)] if muitos_estourados else []
+        # Texto resumido para o prompt (QA, sem exagerar em siglas)
+        csat_txt = f'{avg_csat:.1f}' if avg_csat is not None else 'sem notas'
+        regras_analista = [
+            'Avalie como QA o desempenho geral do analista nos chamados, com base em:',
+            f'1) CSAT médio nos chamados avaliados: {csat_txt}' + (f' (acima de 3 → ponto positivo)' if csat_ok else ' (3 ou menos → ponto a melhorar)' if avg_csat is not None else '') + '.',
+        ]
+        if muitos_estourados:
+            keys_ex = ', '.join(keys_estourados[:8]) + (' ...' if len(keys_estourados) > 8 else '')
+            regras_analista.append(
+                f'2) Prazos: muitos chamados fora do prazo (X na coluna SLAs): {sla_estourados} fora, {sla_cumpridos} dentro. Cite como ponto a melhorar; se citar, liste as keys (ex.: {keys_ex}).'
+            )
+        else:
+            regras_analista.append(
+                f'2) Prazos: maioria dentro do prazo ({sla_cumpridos} dentro, {sla_estourados} fora). Ponto positivo; não cite prazos como melhoria.'
+            )
+        regras_analista.append(
+            '3) Linguagem: avaliar se foi clara, formal e objetiva. Classificar como ponto forte ou ponto a melhorar conforme os comentários dos chamados.'
+        )
+        regras_bloco = '\n'.join(regras_analista)
+        prompt_principal = (
+            'Responda em português brasileiro. '
+            'Você é um QA avaliando o desempenho dos analistas. Analise os chamados abaixo (todos do mesmo analista) e dê UM ÚNICO feedback em UMA ÚNICA FRASE. '
+            'Na frase, considere: CSAT médio nos chamados avaliados, cumprimento de prazos e se a linguagem foi clara, formal e objetiva. '
+            'Diga o que precisa melhorar e o que está bom.\n\n'
+            + regras_bloco + '\n\n'
+            + criterios_base +
+            'Chamados deste analista no período:\n' + context
+        )
+        feedback = ''
+        max_tentativas = 3
+        for tentativa in range(max_tentativas):
+            content = _ollama_feedback_analista_single(prompt_principal, ollama_url)
+            feedback = (content or '').strip()
+            if not feedback and content:
+                feedback = content.strip()
+            if feedback:
+                if len(feedback) > 500:
+                    feedback = feedback[:497].rsplit('.', 1)[0] + '.' if '.' in feedback[:497] else feedback[:500]
+                break
+            time.sleep(1.0)
+        ticket_keys = [t.get('key') for t in tickets if t.get('key')]
+        ticket_details = []
+        for t in tickets:
+            key = t.get('key')
+            if not key:
+                continue
+            summary, _ = get_issue_summary_and_description(t, field_ids)
+            summary = ((summary or '').strip() or '(sem título)')[:300]
+            slas = (sla_by_key or {}).get(key) or []
+            sla_status = '—'
+            sla_text = '—'
+            if slas:
+                breached = _issue_sla_breached(key, sla_by_key)
+                sla_status = 'Estourado' if breached else 'Cumprido'
+                sla_text = _format_sla_list_for_ollama(slas, only_relevant=False)[:400]
+            ticket_details.append({'key': key, 'summary': summary, 'slaStatus': sla_status, 'slaText': sla_text})
+        result.append({
+            'assignee': assignee,
+            'ticketCount': len(tickets),
+            'ticketKeys': ticket_keys,
+            'ticketDetails': ticket_details,
+            'feedback': feedback[:500] if feedback else '—',
+            'melhorias': [],
+            'fortes': [],
+        })
+        if idx < len(analysts) - 1:
+            time.sleep(1.2)
+    return {'byAnalyst': result}
 
 
 def get_issue_note_from_rovo(issue, rovo_url, rovo_api_key=None, criteria=None):
@@ -2041,24 +2331,66 @@ def _reopened_jql_for_period(month, year):
         return None
 
 
+def _reopened_jql_for_date_range(first_yyyymmdd, last_yyyymmdd):
+    """Monta JQL de reabertura para um intervalo de datas (mesmo período da lista).
+    first_yyyymmdd/last_yyyymmdd: strings 'YYYY-MM-DD'."""
+    if not first_yyyymmdd or not last_yyyymmdd or len(first_yyyymmdd) < 10 or len(last_yyyymmdd) < 10:
+        return None
+    first = first_yyyymmdd[:10]
+    last = last_yyyymmdd[:10]
+    return f'{REOPENED_JQL_BASE} DURING ("{first}", "{last}")'
+
+
+def _parse_jql_date_range(jql):
+    """Extrai intervalo de datas da JQL (created >= "Y-M-D" AND created <= "Y-M-D").
+    Retorna (first_yyyymmdd, last_yyyymmdd) ou (None, None)."""
+    import re
+    if not jql or not isinstance(jql, str):
+        return None, None
+    # created >= "YYYY-MM-DD" e created <= "YYYY-MM-DD"
+    m_first = re.search(r'created\s*>=\s*["\'](\d{4}-\d{2}-\d{2})', jql, re.IGNORECASE)
+    m_last = re.search(r'created\s*<=\s*["\'](\d{4}-\d{2}-\d{2})', jql, re.IGNORECASE)
+    if m_first and m_last:
+        return m_first.group(1), m_last.group(1)
+    return None, None
+
+
 def stats_reopened_for_period(auth, field_ids, month, year, limit=5000):
     """
     Busca tickets reabertos no mesmo período (mês/ano) selecionado no modo lista.
     JQL: status CHANGED FROM ("Done", "Closed", "Resolved") DURING (início, fim do mês).
-    Retorna { 'total', 'byPeriod': [ { period, count } ], 'keys': [ ... ] }.
+    Retorna { 'total', 'byPeriod': [ { period, count } ], 'keys': [ ... ], 'issues': [ ... ] }.
     Em falha (ex.: Jira sem suporte a DURING com CHANGED), retorna total 0 e listas vazias.
     """
     jql = _reopened_jql_for_period(month, year)
     if not jql or not auth:
-        return {'total': 0, 'byPeriod': [], 'keys': []}
+        return {'total': 0, 'byPeriod': [], 'keys': [], 'issues': []}
     try:
         issues = search_jql(auth, jql, field_ids, limit=limit)
     except Exception:
-        return {'total': 0, 'byPeriod': [], 'keys': []}
+        return {'total': 0, 'byPeriod': [], 'keys': [], 'issues': []}
     keys = [i.get('key') for i in issues if i.get('key')]
     period_key = f'{year}-{month:02d}' if month and year else None
     by_period = [{'period': period_key, 'count': len(issues)}] if period_key else []
-    return {'total': len(issues), 'byPeriod': by_period, 'keys': keys}
+    return {'total': len(issues), 'byPeriod': by_period, 'keys': keys, 'issues': issues}
+
+
+def stats_reopened_for_date_range(auth, field_ids, first_yyyymmdd, last_yyyymmdd, limit=5000):
+    """
+    Busca tickets reabertos no mesmo intervalo de datas (created) usado na JQL da lista.
+    Retorna { 'total', 'byPeriod': [ { period, count } ], 'keys': [ ... ], 'issues': [ ... ] }.
+    """
+    jql = _reopened_jql_for_date_range(first_yyyymmdd, last_yyyymmdd)
+    if not jql or not auth:
+        return {'total': 0, 'byPeriod': [], 'keys': [], 'issues': []}
+    try:
+        issues = search_jql(auth, jql, field_ids, limit=limit)
+    except Exception:
+        return {'total': 0, 'byPeriod': [], 'keys': [], 'issues': []}
+    keys = [i.get('key') for i in issues if i.get('key')]
+    period_key = first_yyyymmdd[:7] if first_yyyymmdd and len(first_yyyymmdd) >= 7 else None
+    by_period = [{'period': period_key or 'Período', 'count': len(issues)}]
+    return {'total': len(issues), 'byPeriod': by_period, 'keys': keys, 'issues': issues}
 
 
 def _format_seconds(seconds):
@@ -2358,11 +2690,14 @@ def get_row_values(issue, field_ids):
 
 
 def _issue_sla_breached(issue_key, sla_by_key):
-    """True se o chamado tem pelo menos um SLA relevante (TTR/FRT/Time to close) estourado. Usa dados da coluna SLAs."""
+    """True se o chamado tem pelo menos um SLA relevante (TTR/FRT/Time to close) estourado.
+    Considera SLA estourado SOMENTE quando na coluna SLAs do modo lista o chamado exibe o ícone X (vermelho),
+    ou seja, algum SLA relevante com met=False (mesma fonte e critério da lista)."""
     slas = (sla_by_key or {}).get(issue_key) or []
     relevant = [s for s in slas if _sla_name_is_relevant(s.get('name'))]
     if not relevant:
         return False
+    # met=False = ícone X na lista (estourado); met=True = ✓ (cumprido)
     return any(not s.get('met', True) for s in relevant)
 
 
