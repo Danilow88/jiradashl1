@@ -1,13 +1,14 @@
-# Jira Utilities
+# Jira Utilities / L1 Dashboard
 
-A command-line tool for interacting with Cornelis Networks' Jira instance. This utility provides various functions for querying projects, tickets, releases, and performing bulk updates.
+Ferramentas para Jira: CLI para projetos, tickets e releases; **L1 Dashboard** (web) para análise de chamados L1, notas, pontos de melhoria/fortes e integração com Ollama e planilhas.
 
-## Table of Contents
+## Índice
 
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Authentication](#authentication)
-- [Usage](#usage)
+- [Requisitos](#requisitos)
+- [Instalação](#instalação)
+- [Configuração](#configuração)
+- [Uso rápido (L1 Dashboard web)](#uso-rápido-l1-dashboard-web)
+- [Usage (CLI)](#usage)
 - [Command Reference](#command-reference)
 - [Examples](#examples)
 - [Output Formats](#output-formats)
@@ -16,71 +17,66 @@ A command-line tool for interacting with Cornelis Networks' Jira instance. This 
 - [L1 Dashboard](#l1-dashboard)
 - [Draw.io Diagram Generation](#drawio-diagram-generation)
 
-## Requirements
+## Requisitos
 
-- Python 3.9 or higher
-- Access to Cornelis Networks Jira instance
-- Jira API token
+- **Python 3.9+**
+- Acesso a uma instância Jira (Cloud ou Server) e token de API
+- Para L1 Dashboard com notas/IA: **Ollama** instalado e rodando (opcional)
 
-### Python Dependencies
+## Instalação
 
-- `jira` - Jira API client library
-- `python-dotenv` - Load environment variables from .env file
-- `requests` - HTTP library for API calls
+Todas as dependências estão no `requirements.txt`. Use um ambiente virtual para não poluir o Python do sistema.
 
-## Installation
-
-1. Clone or download this repository
-
-2. Create and activate a virtual environment:
+1. **Clone o repositório**
    ```bash
-   python3 -m venv venv
-   source venv/bin/activate
+   git clone https://github.com/Danilow88/jiradashl1.git
+   cd jiradashl1
    ```
 
-3. Install dependencies:
+2. **Crie e ative um ambiente virtual**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate   # Linux/macOS
+   # No Windows: .venv\Scripts\activate
+   ```
+
+3. **Instale as dependências com o requirements.txt**
    ```bash
    pip install -r requirements.txt
    ```
+   O `requirements.txt` inclui, entre outros: `jira`, `python-dotenv`, `requests`, `flask`, `gspread`, `google-auth`, `openai`, `google-genai`.
 
-   Or install manually:
-   ```bash
-   pip install jira python-dotenv requests
-   ```
+## Configuração
 
-## Authentication
+As credenciais e URLs são carregadas do arquivo **`.env`** na raiz do projeto. Nunca faça commit do `.env`.
 
-This script uses Jira API tokens for authentication. You need to configure your credentials before running.
-
-### Option 1: Using a .env File (Recommended)
-
-The script automatically loads credentials from a `.env` file in the project directory.
-
-1. Copy the example file:
+1. **Copie o arquivo de exemplo**
    ```bash
    cp .env.example .env
    ```
 
-2. Edit `.env` and fill in your credentials:
-   ```bash
-   JIRA_EMAIL=your.email@cornelisnetworks.com
-   JIRA_API_TOKEN=your_api_token_here
-   ```
+2. **Edite o `.env`** e preencha pelo menos:
+   - **JIRA_URL** – URL da sua instância (ex.: `https://suaempresa.atlassian.net`)
+   - **JIRA_EMAIL** – e-mail da conta Atlassian/Jira
+   - **JIRA_API_TOKEN** – token de API (gerar em: [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens))
 
-3. Generate an API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+3. **Variáveis opcionais** (conforme uso):
+   - **OLLAMA_URL** – para notas e pontos com IA local (ex.: `http://127.0.0.1:11434`). Instale: `brew install ollama` e rode `ollama serve`.
+   - **GOOGLE_SHEET_ID_NOTAS**, **GOOGLE_APPLICATION_CREDENTIALS** – para sincronizar notas/auditoria/pontos com Google Sheets.
+   - **CONFLUENCE_URL** – se usar Confluence para contexto nos pontos de melhoria.
 
-> **Note:** The `.env` file is gitignored for security - your credentials will not be committed to version control.
+O `.env.example` traz a lista completa com comentários. **Nunca commite o `.env`** (ele está no `.gitignore`).
 
-### Option 2: Using Environment Variables
+## Uso rápido (L1 Dashboard web)
 
-Alternatively, you can set environment variables directly:
+Depois de instalar e configurar o `.env`:
 
 ```bash
-export JIRA_EMAIL="your.email@cornelisnetworks.com"
-export JIRA_API_TOKEN="your_api_token_here"
+source .venv/bin/activate
+python l1_dashboard_web.py
 ```
 
-> **IMPORTANT:** Never commit credentials to version control.
+O navegador abre em **http://127.0.0.1:5000/** (ou use `PORT=5001` se a porta 5000 estiver em uso). No dashboard: defina JQL/filtros, clique em **Buscar**, use **Extrair pontos (Ollama)** para análise de pontos de melhoria e fortes, e **Calcular notas** se o Ollama estiver rodando.
 
 ## Usage
 
@@ -468,9 +464,9 @@ Use `-v` (verbose) for debug-level output to stdout, or `-q` (quiet) for minimal
 
 | File | Description |
 |------|-------------|
-| `.env` | Your local credentials (gitignored, never committed) |
-| `.env.example` | Template showing required environment variables |
-| `requirements.txt` | Python package dependencies |
+| `.env` | Suas credenciais locais (gitignored; nunca fazer commit) |
+| `.env.example` | Modelo com as variáveis necessárias; copie para `.env` e preencha |
+| `requirements.txt` | Dependências Python: use `pip install -r requirements.txt` após criar o venv |
 
 ## Error Handling
 
@@ -712,7 +708,7 @@ python l1_dashboard.py --jql 'project = PROJ AND "Support Level - ITOPS" = "L1"'
 Para usar o dashboard como aplicativo com janela e tabela:
 
 ```bash
-source venv/bin/activate
+source .venv/bin/activate
 python l1_dashboard_app.py
 ```
 
@@ -721,21 +717,26 @@ python l1_dashboard_app.py
 - **Duplo clique** em uma linha abre o issue no navegador (Jira).
 - **Exportar HTML**: salva a tabela atual em um arquivo HTML.
 
-Requer as mesmas credenciais (`.env`: `JIRA_EMAIL`, `JIRA_API_TOKEN`). Tkinter vem com o Python; não é necessário instalar nada extra.
+Requer as mesmas credenciais (`.env`: `JIRA_EMAIL`, `JIRA_API_TOKEN`). Tkinter vem com o Python; as demais dependências vêm do `requirements.txt`.
 
-**Se o app Tkinter falhar no macOS** (por exemplo: "macOS 15 (1507) or later required" ou "Tkinter não encontrado"), use a **versão web**:
+**Se o app Tkinter falhar no macOS** (ex.: "macOS 15 (1507) or later required" ou "Tkinter não encontrado"), use a **versão web**:
 
-### Versão web (Flask) – sem Tkinter
+### Versão web (Flask) – recomendada
 
-Roda no navegador e evita problemas de Tk no macOS.
+Roda no navegador; todas as dependências já estão no `requirements.txt` (incluindo `flask`).
 
 ```bash
-source venv/bin/activate
-pip install flask
+source .venv/bin/activate
 python l1_dashboard_web.py
 ```
 
-O navegador abre em **http://127.0.0.1:5000/**. Use a mesma JQL, **Carregar meus filtros**, **Projeto** / **Status** e **Buscar**; **Exportar HTML** baixa o arquivo.
+O navegador abre em **http://127.0.0.1:5000/**. Se a porta 5000 estiver em uso (ex.: AirPlay no macOS), use:
+
+```bash
+PORT=5001 python l1_dashboard_web.py
+```
+
+Use a mesma JQL, **Carregar meus filtros**, **Projeto** / **Status** e **Buscar**; **Exportar HTML** baixa o arquivo.
 
 ## Draw.io Diagram Generation
 
